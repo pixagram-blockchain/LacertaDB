@@ -1,7 +1,7 @@
-import * as lacerta from "./index.js";
+import * as LACERTA from "./index.js";
         
 if(typeof window != "undefined"){
-    window.lacerta = lacerta;
+    window.LACERTA = LACERTA;
 }else {
-    self.lacerta = lacerta;
+    self.LACERTA = LACERTA;
 }
