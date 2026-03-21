@@ -1,43 +1,7 @@
 /**
- * LacertaDB V0.9.2 - Production Library with QuickStore (Optimized)
- * * A high-performance, browser-based document database with support for:
- * - IndexedDB storage with connection pooling
- * - Multiple caching strategies (LRU, LFU, TTL)
- * - Full-text search and geospatial indexing
- * - Document encryption and compression
- * - Binary attachments via OPFS (Origin Private File System)
- * - MongoDB-like query syntax and aggregation pipeline
- * - Schema migrations and versioning
- * - QuickStore for fast localStorage-based operations
- * * Changelog V0.9.2:
- * - CRITICAL: Fixed non-extractable CryptoKey in _importMasterKeys (changePin was broken).
- * - CRITICAL: Fixed TransactionInactiveError in batchOperation (sync request queueing).
- * - CRITICAL: Fixed batchAdd crash when called without options (from import()).
- * - SECURITY: Constant-time comparison in _arrayEquals (timing attack prevention).
- * - SECURITY: Unbiased PIN generation via rejection sampling.
- * - SECURITY: changePin now verifies oldPin before allowing change.
- * - SECURITY: Standardized AES-GCM IV to 12 bytes in encryptPrivateKey/decryptPrivateKey.
- * - FIX: Environment-safe polyfills (no bare `window` at module scope).
- * - FIX: BTreeIndex.remove only decrements _size when key/value actually existed.
- * - FIX: LFUCache.has() now checks TTL expiration.
- * - FIX: GeoIndex._size cannot go negative on redundant removePoint calls.
- * - FIX: $group aggregation uses JSON.stringify for object keys (Map comparison).
- * - FIX: TextIndex tokenizer minimum length normalized across code paths.
- * - FIX: QuickStore properly cleans up beforeunload listener via destroy().
- * - FIX: Consistent window.requestIdleCallback usage in _saveIndexMetadata.
- * - FIX: Block-scoped const in $avg aggregation case.
- * * Changelog V0.9.1:
- * - CRITICAL: Implemented Master Key Wrapping for encryption (fixes data loss on PIN change).
- * - CRITICAL: Fixed UI freezing in QuickStore using in-memory caching and async persistence.
- * - CRITICAL: Replaced O(N) GeoIndex with O(log N) QuadTree.
- * - CRITICAL: Fixed TransactionInactiveError by implementing Batch Processing for Indexes.
- * - SECURITY: Increased PBKDF2 iterations to 600,000 (OWASP standard).
- * - OPTIMIZATION: Removed Global Mutex for read operations (concurrency fix).
- * - OPTIMIZATION: Implemented Cursor-based indexing (OOM fix).
- * - FIX: Added Magic Byte check for robust compression detection.
- * - FIX: Use Intl.Segmenter for proper CJK text tokenization.
- * * @module LacertaDB
- * @version 0.9.2
+ * LacertaDB V0.11.1 - Production Library
+ * @module LacertaDB
+ * @version 0.11.1
  * @license MIT
  * @author Pixagram SA
  */
@@ -62,19 +26,18 @@ if (typeof window !== 'undefined' && !window.requestIdleCallback) {
 import TurboSerial from "@pixagram/turboserial";
 import TurboBase64 from "@pixagram/turbobase64";
 
-const serializer = new TurboSerial({
-    compression: true,        // Enable built-in compression
-    deduplication: false,      // Deduplicate repeated values
-    simdOptimization: true,   // Use SIMD instructions when available
-    detectCircular: false,      // Handle circular references
-    shareArrayBuffers: false,      // Share ArrayBuffer references
-    allowFunction: false,         // Allow function storage/retrieval (security gate)
-    serializeFunctions: false,    // Capture and reconstruct function source
-    preservePropertyDescriptors: false, // Preserve property descriptors
-    memoryPoolSize: 65536*16         // Initial memory pool size (1MB)
-});
-
-const base64 = new TurboBase64();
+// Default TurboSerial configuration (overridable via LacertaDB constructor)
+const TURBO_SERIAL_DEFAULTS = {
+    compression: true,
+    preservePropertyDescriptors: true,
+    deduplication: false,
+    simdOptimization: true,
+    detectCircular: true,
+    shareArrayBuffers: true,
+    allowFunction: false,
+    serializeFunctions: false,
+    memoryPoolSize: 65536 * 16
+};
 
 // ========================
 // Quick Store (Optimized)
@@ -85,15 +48,17 @@ const base64 = new TurboBase64();
  * Keeps index in memory to avoid blocking main thread with JSON parsing.
  */
 class QuickStore {
-    constructor(dbName) {
+    constructor(dbName, serializer, base64) {
         this._dbName = dbName;
+        this._serializer = serializer;
+        this._base64 = base64;
         this._keyPrefix = `lacertadb_${dbName}_quickstore_`;
         this._indexKey = `${this._keyPrefix}index`;
-        
+
         // Optimization: Keep index in memory using a Set for O(1) lookups
         this._indexCache = new Set();
         this._indexLoaded = false;
-        
+
         // Async persistence state
         this._saveIndexTimer = null;
         this._dirty = false;
@@ -123,12 +88,12 @@ class QuickStore {
 
     _ensureIndexLoaded() {
         if (this._indexLoaded) return;
-        
+
         const indexStr = localStorage.getItem(this._indexKey);
         if (indexStr) {
             try {
-                const decoded = base64.decode(indexStr);
-                const list = serializer.deserialize(decoded);
+                const decoded = this._base64.decode(indexStr);
+                const list = this._serializer.deserialize(decoded);
                 this._indexCache = new Set(list);
             } catch (e) {
                 console.warn('QuickStore index corrupted, resetting.', e);
@@ -144,16 +109,27 @@ class QuickStore {
 
         const save = () => {
             if (!this._dirty) return;
-            const list = Array.from(this._indexCache);
-            const serializedIndex = serializer.serialize(list);
-            const encodedIndex = base64.encode(serializedIndex);
-            localStorage.setItem(this._indexKey, encodedIndex);
-            this._dirty = false;
+            try {
+                const list = Array.from(this._indexCache);
+                const serializedIndex = this._serializer.serialize(list);
+                const encodedIndex = this._base64.encode(serializedIndex);
+                localStorage.setItem(this._indexKey, encodedIndex);
+                this._dirty = false;
+            } catch (e) {
+                if (e.name === 'QuotaExceededError') {
+                    console.error('CRITICAL: QuickStore index save failed — localStorage quota exceeded');
+                    if (typeof window !== 'undefined') {
+                        window.dispatchEvent(new CustomEvent('lacertadb:quotaexceeded', { detail: { source: 'quickstore', db: this._dbName } }));
+                    }
+                } else {
+                    console.error('QuickStore index save failed:', e);
+                }
+            }
             this._saveIndexTimer = null;
         };
 
         // Debounce with idle callback to prevent UI freezing
-        if (window.requestIdleCallback) {
+        if (typeof window !== 'undefined' && window.requestIdleCallback) {
             this._saveIndexTimer = window.requestIdleCallback(save);
         } else {
             this._saveIndexTimer = setTimeout(save, 200);
@@ -162,19 +138,30 @@ class QuickStore {
 
     _flushSync() {
         if (!this._dirty) return;
-        const list = Array.from(this._indexCache);
-        const serializedIndex = serializer.serialize(list);
-        const encodedIndex = base64.encode(serializedIndex);
-        localStorage.setItem(this._indexKey, encodedIndex);
-        this._dirty = false;
+        try {
+            const list = Array.from(this._indexCache);
+            const serializedIndex = this._serializer.serialize(list);
+            const encodedIndex = this._base64.encode(serializedIndex);
+            localStorage.setItem(this._indexKey, encodedIndex);
+            this._dirty = false;
+        } catch (e) {
+            if (e.name === 'QuotaExceededError') {
+                console.error('CRITICAL: QuickStore flush failed — localStorage quota exceeded');
+                if (typeof window !== 'undefined') {
+                    window.dispatchEvent(new CustomEvent('lacertadb:quotaexceeded', { detail: { source: 'quickstore_flush', db: this._dbName } }));
+                }
+            } else {
+                console.error('QuickStore flush failed:', e);
+            }
+        }
     }
 
     add(docId, data) {
         this._ensureIndexLoaded();
         const key = `${this._keyPrefix}data_${docId}`;
         try {
-            const serializedData = serializer.serialize(data);
-            const encodedData = base64.encode(serializedData);
+            const serializedData = this._serializer.serialize(data);
+            const encodedData = this._base64.encode(serializedData);
             localStorage.setItem(key, encodedData);
 
             if (!this._indexCache.has(docId)) {
@@ -196,8 +183,8 @@ class QuickStore {
         const stored = localStorage.getItem(key);
         if (stored) {
             try {
-                const decoded = base64.decode(stored);
-                return serializer.deserialize(decoded);
+                const decoded = this._base64.decode(stored);
+                return this._serializer.deserialize(decoded);
             } catch (e) {
                 console.error('Failed to parse QuickStore data:', e);
             }
@@ -581,7 +568,7 @@ class CacheStrategy {
         const type = this._config.type || 'lru';
         const max = this._config.maxSize || 100;
         const ttl = this._config.ttl;
-        
+
         if (type === 'none' || this._config.enabled === false) return null;
         if (type === 'ttl') return new TTLCache(ttl);
         if (type === 'lfu') return new LFUCache(max, ttl);
@@ -628,9 +615,9 @@ class CacheStrategy {
 // ========================
 
 class BrowserCompressionUtility {
-    // Magic header to distinguish compressed data. 
+    // Magic header to distinguish compressed data.
     // 0x01 = Compressed (Deflate), 0x00 = Raw
-    
+
     async compress(input) {
         if (!(input instanceof Uint8Array)) {
             throw new TypeError('Input must be Uint8Array');
@@ -656,7 +643,7 @@ class BrowserCompressionUtility {
             throw new TypeError('Input must be Uint8Array');
         }
         if (input.length === 0) return input;
-        
+
         const marker = input[0];
         const data = input.slice(1);
 
@@ -782,13 +769,15 @@ class BrowserEncryptionUtility {
 // ========================
 
 class SecureDatabaseEncryption {
-    constructor(config = {}) {
+    constructor(config = {}, serializer, base64) {
         this._iterations = config.iterations || 600000; // Increased to OWASP recommendation
         this._hashAlgorithm = config.hashAlgorithm || 'SHA-256';
         this._keyLength = config.keyLength || 256;
         this._saltLength = config.saltLength || 32;
         this._initialized = false;
-        
+        this._serializer = serializer;
+        this._base64 = base64;
+
         this._masterKey = null; // The actual key used for data encryption
         this._hmacKey = null;   // Key for HMAC operations
         this._salt = null;      // Salt for KEK derivation
@@ -807,11 +796,11 @@ class SecureDatabaseEncryption {
 
         if (existingMetadata) {
             // Load existing
-            this._salt = base64.decode(existingMetadata.salt);
+            this._salt = this._base64.decode(existingMetadata.salt);
             const kek = await this._deriveKEK(pinBytes, this._salt);
-            
+
             // Unwrap Master Key
-            const wrappedBytes = base64.decode(existingMetadata.wrappedKey);
+            const wrappedBytes = this._base64.decode(existingMetadata.wrappedKey);
             const iv = wrappedBytes.slice(0, 12);
             const encryptedMK = wrappedBytes.slice(12);
 
@@ -827,22 +816,22 @@ class SecureDatabaseEncryption {
             // New Database
             this._salt = crypto.getRandomValues(new Uint8Array(this._saltLength));
             const kek = await this._deriveKEK(pinBytes, this._salt);
-            
+
             // Generate Master Keys (64 bytes: 32 enc + 32 hmac)
             const rawKeys = crypto.getRandomValues(new Uint8Array(64));
             await this._importMasterKeys(rawKeys.buffer);
-            
+
             // Wrap Master Key
             const iv = crypto.getRandomValues(new Uint8Array(12));
             const encryptedMK = await crypto.subtle.encrypt(
                 { name: 'AES-GCM', iv }, kek, rawKeys
             );
-            
+
             const wrappedKey = new Uint8Array(12 + encryptedMK.byteLength);
             wrappedKey.set(iv, 0);
             wrappedKey.set(new Uint8Array(encryptedMK), 12);
-            
-            this._wrappedKeyBlob = base64.encode(wrappedKey);
+
+            this._wrappedKeyBlob = this._base64.encode(wrappedKey);
         }
 
         this._initialized = true;
@@ -896,7 +885,7 @@ class SecureDatabaseEncryption {
 
         // Verify old PIN by attempting to unwrap current master key
         const oldKek = await this._deriveKEK(new TextEncoder().encode(oldPin), this._salt);
-        const currentWrappedBytes = base64.decode(this._wrappedKeyBlob);
+        const currentWrappedBytes = this._base64.decode(this._wrappedKeyBlob);
         const currentIv = currentWrappedBytes.slice(0, 12);
         const currentEncMK = currentWrappedBytes.slice(12);
         try {
@@ -924,8 +913,8 @@ class SecureDatabaseEncryption {
 
         // Update State
         this._salt = newSalt;
-        this._wrappedKeyBlob = base64.encode(wrappedKey);
-        
+        this._wrappedKeyBlob = this._base64.encode(wrappedKey);
+
         return this.exportMetadata();
     }
 
@@ -940,7 +929,7 @@ class SecureDatabaseEncryption {
         } else if (data instanceof Uint8Array) {
             dataBytes = data;
         } else {
-            dataBytes = serializer.serialize(data);
+            dataBytes = this._serializer.serialize(data);
         }
 
         const iv = crypto.getRandomValues(new Uint8Array(12));
@@ -1021,7 +1010,7 @@ class SecureDatabaseEncryption {
         } else if (privateKey instanceof Uint8Array) {
             keyData = privateKey;
         } else {
-            keyData = serializer.serialize(privateKey);
+            keyData = this._serializer.serialize(privateKey);
         }
 
         const iv = crypto.getRandomValues(new Uint8Array(12));
@@ -1047,7 +1036,7 @@ class SecureDatabaseEncryption {
         result.set(authData, 16);
         result.set(new Uint8Array(encryptedKey), 16 + authData.length);
 
-        return base64.encode(result);
+        return this._base64.encode(result);
     }
 
     async decryptPrivateKey(encryptedKeyString, additionalAuth = '') {
@@ -1055,7 +1044,7 @@ class SecureDatabaseEncryption {
             throw new Error('Database encryption not initialized');
         }
 
-        const encryptedPackage = base64.decode(encryptedKeyString);
+        const encryptedPackage = this._base64.decode(encryptedKeyString);
 
         const iv = encryptedPackage.slice(0, 12);
         const authLengthBytes = encryptedPackage.slice(12, 16);
@@ -1115,7 +1104,7 @@ class SecureDatabaseEncryption {
 
     exportMetadata() {
         return {
-            salt: base64.encode(this._salt),
+            salt: this._base64.encode(this._salt),
             wrappedKey: this._wrappedKeyBlob,
             iterations: this._iterations,
             algorithm: 'AES-GCM-256',
@@ -1152,7 +1141,7 @@ class QuadTree {
         if (!this.divided) this._subdivide();
 
         return (this.northeast.insert(point) || this.northwest.insert(point) ||
-                this.southeast.insert(point) || this.southwest.insert(point));
+            this.southeast.insert(point) || this.southwest.insert(point));
     }
 
     query(range, found = []) { // range: {x, y, w, h}
@@ -1194,12 +1183,12 @@ class QuadTree {
 
     _contains(b, p) {
         return (p.x >= b.x - b.w && p.x <= b.x + b.w &&
-                p.y >= b.y - b.h && p.y <= b.y + b.h);
+            p.y >= b.y - b.h && p.y <= b.y + b.h);
     }
 
     _intersects(a, b) {
         return !(b.x - b.w > a.x + a.w || b.x + b.w < a.x - a.w ||
-                 b.y - b.h > a.y + a.h || b.y + b.h < a.y - a.h);
+            b.y - b.h > a.y + a.h || b.y + b.h < a.y - a.h);
     }
 }
 
@@ -1234,21 +1223,53 @@ class BTreeNode {
         return this.children[i] ? this.children[i].search(key) : null;
     }
 
-    rangeSearch(min, max, results) {
+    // Optimized range search with subtree pruning (O(log n + k) instead of O(n))
+    // excludeMin/excludeMax: when true, boundary values are excluded from results
+    rangeSearch(min, max, results, excludeMin = false, excludeMax = false) {
+        // Skip keys strictly below the min bound
         let i = 0;
-        while (i < this.n) {
-            if (!this.leaf && this.children[i]) {
-                this.children[i].rangeSearch(min, max, results);
+        if (min !== null) {
+            while (i < this.n && this.keys[i] < min) {
+                i++;
             }
-            if (this.keys[i] >= min && this.keys[i] <= max) {
-                if (this.values[i]) {
-                    this.values[i].forEach(v => results.push(v));
+            // If min is exclusive, also skip keys equal to min
+            if (excludeMin) {
+                // But first descend into the child at boundary — it may have keys > min
+                // that are relevant. We handle this below in the loop.
+            }
+        }
+
+        // Process keys from i onward
+        for (; i < this.n; i++) {
+            // Early exit: if current key exceeds max (or equals max when exclusive),
+            // descend into left child then stop — no further keys can match
+            if (max !== null) {
+                const pastMax = excludeMax ? this.keys[i] >= max : this.keys[i] > max;
+                if (pastMax) {
+                    if (!this.leaf && this.children[i]) {
+                        this.children[i].rangeSearch(min, max, results, excludeMin, excludeMax);
+                    }
+                    return;
                 }
             }
-            i++;
+
+            // Descend into left child of current key
+            if (!this.leaf && this.children[i]) {
+                this.children[i].rangeSearch(min, max, results, excludeMin, excludeMax);
+            }
+
+            // Check current key against bounds
+            const meetsMin = min === null || (excludeMin ? this.keys[i] > min : this.keys[i] >= min);
+            const meetsMax = max === null || (excludeMax ? this.keys[i] < max : this.keys[i] <= max);
+
+            if (meetsMin && meetsMax && this.values[i]) {
+                this.values[i].forEach(v => results.push(v));
+            }
         }
+
+        // Descend into rightmost child
         if (!this.leaf && this.children[i]) {
-            this.children[i].rangeSearch(min, max, results);
+            this.children[i].rangeSearch(min, max, results, excludeMin, excludeMax);
         }
     }
 
@@ -1288,6 +1309,18 @@ class BTreeNode {
             i++;
             if (this.children[i] && this.children[i].n === 2 * this.order - 1) {
                 this.splitChild(i, this.children[i]);
+
+                // FIX: After split, the promoted median may equal key.
+                // If so, add value to it directly instead of descending
+                // (which would create a duplicate entry in the child).
+                if (this.keys[i] === key) {
+                    if (!this.values[i]) {
+                        this.values[i] = new Set();
+                    }
+                    this.values[i].add(value);
+                    return;
+                }
+
                 if (this.keys[i] < key) {
                     i++;
                 }
@@ -1315,6 +1348,17 @@ class BTreeNode {
 
         y.n = this.order - 1;
 
+        // Clean stale slots in y after split
+        for (let j = this.order - 1; j < 2 * this.order - 1; j++) {
+            y.keys[j] = undefined;
+            y.values[j] = undefined;
+        }
+        if (!y.leaf) {
+            for (let j = this.order; j < 2 * this.order; j++) {
+                y.children[j] = undefined;
+            }
+        }
+
         for (let j = this.n; j >= i + 1; j--) {
             this.children[j + 1] = this.children[j];
         }
@@ -1328,29 +1372,265 @@ class BTreeNode {
 
         this.keys[i] = y.keys[this.order - 1];
         this.values[i] = y.values[this.order - 1];
+        // Clear the promoted median from y (it's now in the parent)
+        y.keys[this.order - 1] = undefined;
+        y.values[this.order - 1] = undefined;
         this.n++;
     }
 
-    remove(key, value) {
+    // ---- Deletion helpers (proper B-tree delete with rebalancing) ----
+
+    // Get the predecessor: rightmost key in the left subtree of keys[idx]
+    _getPredecessor(idx) {
+        let node = this.children[idx];
+        while (!node.leaf) {
+            node = node.children[node.n];
+        }
+        return { key: node.keys[node.n - 1], value: node.values[node.n - 1] };
+    }
+
+    // Get the successor: leftmost key in the right subtree of keys[idx]
+    _getSuccessor(idx) {
+        let node = this.children[idx + 1];
+        while (!node.leaf) {
+            node = node.children[0];
+        }
+        return { key: node.keys[0], value: node.values[0] };
+    }
+
+    // Merge children[idx+1] into children[idx], pulling keys[idx] down as separator
+    _merge(idx) {
+        const child = this.children[idx];
+        const sibling = this.children[idx + 1];
+        const t = this.order;
+
+        // Pull separator key down into child
+        child.keys[t - 1] = this.keys[idx];
+        child.values[t - 1] = this.values[idx];
+
+        // Copy keys/values from sibling into child
+        for (let j = 0; j < sibling.n; j++) {
+            child.keys[t + j] = sibling.keys[j];
+            child.values[t + j] = sibling.values[j];
+        }
+
+        // Copy children from sibling
+        if (!child.leaf) {
+            for (let j = 0; j <= sibling.n; j++) {
+                child.children[t + j] = sibling.children[j];
+            }
+        }
+
+        child.n += sibling.n + 1;
+
+        // Shift keys/values left in this node to fill the gap
+        for (let j = idx; j < this.n - 1; j++) {
+            this.keys[j] = this.keys[j + 1];
+            this.values[j] = this.values[j + 1];
+        }
+
+        // Shift children left in this node
+        for (let j = idx + 1; j < this.n; j++) {
+            this.children[j] = this.children[j + 1];
+        }
+
+        // Clean stale trailing slots
+        this.keys[this.n - 1] = undefined;
+        this.values[this.n - 1] = undefined;
+        this.children[this.n] = undefined;
+
+        this.n--;
+    }
+
+    // Borrow the last key from children[idx-1] through the parent
+    _borrowFromPrev(idx) {
+        const child = this.children[idx];
+        const sibling = this.children[idx - 1];
+
+        // Shift everything in child right by 1
+        for (let j = child.n - 1; j >= 0; j--) {
+            child.keys[j + 1] = child.keys[j];
+            child.values[j + 1] = child.values[j];
+        }
+        if (!child.leaf) {
+            for (let j = child.n; j >= 0; j--) {
+                child.children[j + 1] = child.children[j];
+            }
+        }
+
+        // Move separator from parent down to child[0]
+        child.keys[0] = this.keys[idx - 1];
+        child.values[0] = this.values[idx - 1];
+
+        // Move last child of sibling to child
+        if (!child.leaf) {
+            child.children[0] = sibling.children[sibling.n];
+            sibling.children[sibling.n] = undefined;
+        }
+
+        // Move last key of sibling up to parent
+        this.keys[idx - 1] = sibling.keys[sibling.n - 1];
+        this.values[idx - 1] = sibling.values[sibling.n - 1];
+
+        // Clean stale slots in sibling
+        sibling.keys[sibling.n - 1] = undefined;
+        sibling.values[sibling.n - 1] = undefined;
+
+        child.n++;
+        sibling.n--;
+    }
+
+    // Borrow the first key from children[idx+1] through the parent
+    _borrowFromNext(idx) {
+        const child = this.children[idx];
+        const sibling = this.children[idx + 1];
+
+        // Move separator from parent down to end of child
+        child.keys[child.n] = this.keys[idx];
+        child.values[child.n] = this.values[idx];
+
+        // Move first child of sibling to child
+        if (!child.leaf) {
+            child.children[child.n + 1] = sibling.children[0];
+        }
+
+        // Move first key of sibling up to parent
+        this.keys[idx] = sibling.keys[0];
+        this.values[idx] = sibling.values[0];
+
+        // Shift sibling's keys/values left
+        for (let j = 0; j < sibling.n - 1; j++) {
+            sibling.keys[j] = sibling.keys[j + 1];
+            sibling.values[j] = sibling.values[j + 1];
+        }
+        if (!sibling.leaf) {
+            for (let j = 0; j < sibling.n; j++) {
+                sibling.children[j] = sibling.children[j + 1];
+            }
+            sibling.children[sibling.n] = undefined;
+        }
+
+        // Clean stale trailing slots in sibling
+        sibling.keys[sibling.n - 1] = undefined;
+        sibling.values[sibling.n - 1] = undefined;
+
+        child.n++;
+        sibling.n--;
+    }
+
+    // Ensure children[idx] has at least `order` keys (minimum degree)
+    // so we can safely descend into it during deletion
+    _fill(idx) {
+        const t = this.order;
+        if (idx > 0 && this.children[idx - 1] && this.children[idx - 1].n >= t) {
+            this._borrowFromPrev(idx);
+        } else if (idx < this.n && this.children[idx + 1] && this.children[idx + 1].n >= t) {
+            this._borrowFromNext(idx);
+        } else {
+            // Merge with a sibling
+            if (idx < this.n) {
+                this._merge(idx);
+            } else {
+                this._merge(idx - 1);
+            }
+        }
+    }
+
+    // Remove a leaf-level key entry (shift keys, values left)
+    _removeFromLeaf(idx) {
+        for (let j = idx; j < this.n - 1; j++) {
+            this.keys[j] = this.keys[j + 1];
+            this.values[j] = this.values[j + 1];
+        }
+        this.keys[this.n - 1] = undefined;
+        this.values[this.n - 1] = undefined;
+        this.n--;
+    }
+
+    // Remove an internal key entry using predecessor/successor replacement
+    _removeFromInternal(idx) {
+        const t = this.order;
+        const key = this.keys[idx];
+
+        if (this.children[idx] && this.children[idx].n >= t) {
+            // Left child has enough keys: replace with predecessor
+            const pred = this._getPredecessor(idx);
+            this.keys[idx] = pred.key;
+            this.values[idx] = pred.value;
+            this.children[idx]._remove(pred.key, null, true);
+        } else if (this.children[idx + 1] && this.children[idx + 1].n >= t) {
+            // Right child has enough keys: replace with successor
+            const succ = this._getSuccessor(idx);
+            this.keys[idx] = succ.key;
+            this.values[idx] = succ.value;
+            this.children[idx + 1]._remove(succ.key, null, true);
+        } else {
+            // Both children at minimum: merge them, then delete from merged child
+            this._merge(idx);
+            this.children[idx]._remove(key, null, true);
+        }
+    }
+
+    // Core removal engine.
+    // removeEntire=false: remove one value from the Set; delete key entry if Set empties
+    // removeEntire=true:  delete the entire key entry regardless of Set contents
+    // Returns true if a key entry was fully removed, false otherwise
+    _remove(key, value, removeEntire) {
         let i = 0;
         while (i < this.n && key > this.keys[i]) {
             i++;
         }
 
         if (i < this.n && key === this.keys[i]) {
-            if (this.values[i]) {
+            // Key found at this node
+            let shouldRemoveEntry = removeEntire;
+
+            if (!shouldRemoveEntry && this.values[i]) {
                 this.values[i].delete(value);
-                if (this.values[i].size === 0) {
-                    for (let j = i; j < this.n - 1; j++) {
-                        this.keys[j] = this.keys[j + 1];
-                        this.values[j] = this.values[j + 1];
-                    }
-                    this.n--;
-                }
+                shouldRemoveEntry = this.values[i].size === 0;
             }
-        } else if (!this.leaf && this.children[i]) {
-            this.children[i].remove(key, value);
+
+            if (shouldRemoveEntry) {
+                if (this.leaf) {
+                    this._removeFromLeaf(i);
+                } else {
+                    this._removeFromInternal(i);
+                }
+                return true;
+            }
+            return false;
+        } else {
+            // Key not found at this level — descend
+            if (this.leaf) return false;
+
+            const isLastChild = (i === this.n);
+
+            // Ensure the child we descend into has enough keys for safe deletion
+            if (this.children[i] && this.children[i].n < this.order) {
+                this._fill(i);
+            }
+
+            // After _fill, if the last child was merged, idx shifted
+            if (isLastChild && i > this.n) {
+                return this.children[i - 1]
+                    ? this.children[i - 1]._remove(key, value, removeEntire)
+                    : false;
+            } else {
+                return this.children[i]
+                    ? this.children[i]._remove(key, value, removeEntire)
+                    : false;
+            }
         }
+    }
+
+    // Public remove: remove a single (key, value) pair
+    remove(key, value) {
+        return this._remove(key, value, false);
+    }
+
+    // Public removeKey: remove an entire key entry (used internally for predecessor/successor cleanup)
+    removeKey(key) {
+        return this._remove(key, null, true);
     }
 
     verify() {
@@ -1386,6 +1666,14 @@ class BTreeIndex {
             this.verify();
         }
 
+        // Check for exact duplicate (key, value) to keep _size accurate
+        if (this._root) {
+            const existing = this._root.search(key);
+            if (existing && existing.has(value)) {
+                return; // Already present, no-op
+            }
+        }
+
         if (!this._root) {
             this._root = new BTreeNode(this._order, true);
             this._root.keys[0] = key;
@@ -1397,9 +1685,15 @@ class BTreeIndex {
                 s.children[0] = this._root;
                 s.splitChild(0, this._root);
 
+                // FIX: Check if promoted median equals key
                 let i = 0;
-                if (s.keys[0] < key) i++;
-                s.children[i].insertNonFull(key, value);
+                if (s.keys[0] === key) {
+                    if (!s.values[0]) s.values[0] = new Set();
+                    s.values[0].add(value);
+                } else {
+                    if (s.keys[0] < key) i++;
+                    s.children[i].insertNonFull(key, value);
+                }
 
                 this._root = s;
             } else {
@@ -1420,24 +1714,24 @@ class BTreeIndex {
         return this._root.search(key) !== null;
     }
 
-    range(min, max) {
+    range(min, max, excludeMin = false, excludeMax = false) {
         if (!this._root) return [];
         const results = [];
-        this._root.rangeSearch(min, max, results);
+        this._root.rangeSearch(min, max, results, excludeMin, excludeMax);
         return results;
     }
 
-    rangeFrom(min) {
+    rangeFrom(min, excludeMin = false) {
         if (!this._root) return [];
         const results = [];
-        this._root.rangeSearch(min, Infinity, results);
+        this._root.rangeSearch(min, null, results, excludeMin, false);
         return results;
     }
 
-    rangeTo(max) {
+    rangeTo(max, excludeMax = false) {
         if (!this._root) return [];
         const results = [];
-        this._root.rangeSearch(-Infinity, max, results);
+        this._root.rangeSearch(null, max, results, false, excludeMax);
         return results;
     }
 
@@ -1446,6 +1740,7 @@ class BTreeIndex {
         const existing = this._root.search(key);
         if (existing && existing.has(value)) {
             this._root.remove(key, value);
+            // Shrink root if it became empty (all keys merged down)
             if (this._root.n === 0 && !this._root.leaf && this._root.children[0]) {
                 this._root = this._root.children[0];
             }
@@ -1458,13 +1753,20 @@ class BTreeIndex {
         if (!this._root) return { healthy: true, issues: [] };
         const issues = this._root.verify();
         if (issues.length > 0) {
-            console.warn('BTree index issues detected and fixed:', issues);
+            // NOTE: verify detects structural violations but cannot auto-repair.
+            // A full rebuild is required to fix a corrupted index.
+            console.warn('BTree index issues detected (rebuild required):', issues);
         }
         return {
             healthy: issues.length === 0,
             issues,
-            repaired: issues.length
+            requiresRebuild: issues.length > 0
         };
+    }
+
+    clear() {
+        this._root = null;
+        this._size = 0;
     }
 
     get size() {
@@ -1480,7 +1782,7 @@ class TextIndex {
     constructor() {
         this._invertedIndex = new Map();
         this._docTokens = new Map();
-        this._segmenter = typeof Intl !== 'undefined' && Intl.Segmenter ? 
+        this._segmenter = typeof Intl !== 'undefined' && Intl.Segmenter ?
             new Intl.Segmenter(undefined, { granularity: 'word' }) : null;
     }
 
@@ -1566,7 +1868,7 @@ class TextIndex {
 
 class GeoIndex {
     constructor() {
-        this._tree = new QuadTree({x: 0, y: 0, w: 180, h: 90}); 
+        this._tree = new QuadTree({x: 0, y: 0, w: 180, h: 90});
         this._size = 0;
     }
 
@@ -1589,15 +1891,15 @@ class GeoIndex {
     }
 
     findNear(center, maxDistance) {
-        const rangeDeg = maxDistance / 111; 
+        const rangeDeg = maxDistance / 111;
         const range = {
-            x: center.lng, y: center.lat, 
+            x: center.lng, y: center.lat,
             w: rangeDeg, h: rangeDeg
         };
-        
+
         const candidates = this._tree.query(range);
         const results = [];
-        
+
         for (const p of candidates) {
             const distance = this._haversine(center, {lat: p.y, lng: p.x});
             if (distance <= maxDistance) {
@@ -1616,7 +1918,7 @@ class GeoIndex {
         const h = (bounds.maxLat - bounds.minLat) / 2;
         const x = bounds.minLng + w;
         const y = bounds.minLat + h;
-        
+
         const candidates = this._tree.query({x, y, w, h});
         return candidates.map(p => p.data);
     }
@@ -1650,6 +1952,8 @@ class GeoIndex {
 class IndexManager {
     constructor(collection) {
         this._collection = collection;
+        this._serializer = collection.database._serializer;
+        this._base64 = collection.database._base64;
         this._indexes = new Map();
         this._indexData = new Map();
         this._indexQueue = [];
@@ -1699,30 +2003,30 @@ class IndexManager {
         // This prevents transaction timeouts caused by async crypto operations inside the loop
         let lastKey = null;
         const batchSize = 100; // Keep batch small for responsiveness
-        
+
         while (true) {
             // 1. Fetch Batch (Transaction opens and closes here)
             const batch = await this._collection._indexedDB.getBatch(
-                this._collection._db, 
-                'documents', 
-                lastKey, 
+                this._collection._db,
+                'documents',
+                lastKey,
                 batchSize
             );
-            
+
             if (batch.length === 0) break;
-            
+
             // 2. Process Batch (Async crypto operations safe here)
             for (const docData of batch) {
                 lastKey = docData._id; // Update for next batch
                 let doc = docData;
-                
+
                 if (docData.packedData) {
                     const d = new Document(docData, {
-                        compressed: docData._compressed, 
+                        compressed: docData._compressed,
                         encrypted: docData._encrypted
-                    });
+                    }, this._serializer);
                     // This await is what killed the transaction before
-                    await d.unpack(this._collection.database.encryption); 
+                    await d.unpack(this._collection.database.encryption);
                     doc = d.objectOutput();
                 }
 
@@ -1743,7 +2047,7 @@ class IndexManager {
 
                 this._addToIndex(indexData, value, doc._id, index.type);
             }
-            
+
             // Optional: Yield to main thread briefly to prevent UI freeze
             if (window.requestIdleCallback) await new Promise(r => window.requestIdleCallback(r));
         }
@@ -1783,11 +2087,11 @@ class IndexManager {
                 break;
         }
     }
-    
+
     async _hashVal(val) {
         const msg = new TextEncoder().encode(String(val));
         const hash = await crypto.subtle.digest('SHA-256', msg);
-        return base64.encode(new Uint8Array(hash));
+        return this._base64.encode(new Uint8Array(hash));
     }
 
     async updateIndexForDocument(docId, oldDoc, newDoc) {
@@ -1797,7 +2101,7 @@ class IndexManager {
 
             let oldValue = oldDoc ? this._getFieldValue(oldDoc, index.fieldPath) : undefined;
             let newValue = newDoc ? this._getFieldValue(newDoc, index.fieldPath) : undefined;
-            
+
             if (index.hashed) {
                 if (oldValue) oldValue = await this._hashVal(oldValue);
                 if (newValue) newValue = await this._hashVal(newValue);
@@ -1843,9 +2147,9 @@ class IndexManager {
         if (!index || !indexData) {
             throw new Error(`Index '${indexName}' not found`);
         }
-        
+
         if (index.hashed && typeof queryOptions !== 'object') {
-             queryOptions = await this._hashVal(queryOptions);
+            queryOptions = await this._hashVal(queryOptions);
         }
 
         return this._queryIndex(indexData, queryOptions, index.type);
@@ -1879,25 +2183,20 @@ class IndexManager {
             docs.forEach(doc => results.add(doc));
         }
 
-        if (options.$gte !== undefined && options.$lte !== undefined) {
-            const docs = indexData.range(options.$gte, options.$lte);
+        // Combined range queries: pick the tightest bounds and correct exclusivity
+        const hasGte = options.$gte !== undefined;
+        const hasGt  = options.$gt  !== undefined;
+        const hasLte = options.$lte !== undefined;
+        const hasLt  = options.$lt  !== undefined;
+
+        if (hasGte || hasGt || hasLte || hasLt) {
+            const min        = hasGte ? options.$gte : (hasGt ? options.$gt : null);
+            const max        = hasLte ? options.$lte : (hasLt ? options.$lt : null);
+            const excludeMin = !hasGte && hasGt;
+            const excludeMax = !hasLte && hasLt;
+
+            const docs = indexData.range(min, max, excludeMin, excludeMax);
             docs.forEach(doc => results.add(doc));
-        } else if (options.$gte !== undefined) {
-            const docs = indexData.rangeFrom(options.$gte);
-            docs.forEach(doc => results.add(doc));
-        } else if (options.$gt !== undefined) {
-            const docs = indexData.rangeFrom(options.$gt);
-            docs.forEach(doc => {
-                if (doc !== options.$gt) results.add(doc);
-            });
-        } else if (options.$lte !== undefined) {
-            const docs = indexData.rangeTo(options.$lte);
-            docs.forEach(doc => results.add(doc));
-        } else if (options.$lt !== undefined) {
-            const docs = indexData.rangeTo(options.$lt);
-            docs.forEach(doc => {
-                if (doc !== options.$lt) results.add(doc);
-            });
         }
 
         return Array.from(results);
@@ -1971,8 +2270,8 @@ class IndexManager {
                         ...index
                     }))
                 };
-                const serialized = serializer.serialize(metadata);
-                const encoded = base64.encode(serialized);
+                const serialized = this._serializer.serialize(metadata);
+                const encoded = this._base64.encode(serialized);
                 localStorage.setItem(key, encoded);
                 resolve();
             };
@@ -1991,8 +2290,8 @@ class IndexManager {
         if (!stored) return;
 
         try {
-            const decoded = base64.decode(stored);
-            const metadata = serializer.deserialize(decoded);
+            const decoded = this._base64.decode(stored);
+            const metadata = this._serializer.deserialize(decoded);
 
             for (const indexDef of metadata.indexes) {
                 const { name, ...index } = indexDef;
@@ -2035,7 +2334,13 @@ class IndexManager {
                 report[name] = { status: 'missing', rebuilt: true };
                 await this.rebuildIndex(name);
             } else if (indexData.verify) {
-                report[name] = indexData.verify();
+                const result = indexData.verify();
+                if (result.requiresRebuild) {
+                    // BTree detected structural issues — rebuild the index from source data
+                    await this.rebuildIndex(name);
+                    result.rebuilt = true;
+                }
+                report[name] = result;
             } else {
                 report[name] = { status: 'ok' };
             }
@@ -2222,6 +2527,7 @@ class IndexedDBUtility {
             const request = requestFactory();
             request.onsuccess = () => resolve(request.result);
             request.onerror = () => reject(request.error);
+            request.onabort = () => reject(new DOMException('Request aborted', 'AbortError'));
         });
     }
 
@@ -2318,7 +2624,7 @@ class IndexedDBUtility {
 // ========================
 
 class Document {
-    constructor(data = {}, options = {}) {
+    constructor(data = {}, options = {}, serializer) {
         this._id = data._id || this._generateId();
         this._created = data._created || Date.now();
         this._modified = data._modified || Date.now();
@@ -2329,6 +2635,7 @@ class Document {
         this._data = null;
         this._packedData = data.packedData || null;
         this._compression = new BrowserCompressionUtility();
+        this._serializer = serializer;
 
         if (data.data) {
             this.data = data.data;
@@ -2349,7 +2656,7 @@ class Document {
 
     async pack(encryptionUtil = null) {
         try {
-            let packed = serializer.serialize(this.data);
+            let packed = this._serializer.serialize(this.data);
             if (this._compressed) {
                 packed = await this._compression.compress(packed);
             }
@@ -2378,7 +2685,7 @@ class Document {
                 throw new Error('Empty unpacked data');
             }
 
-            this.data = serializer.deserialize(unpacked);
+            this.data = this._serializer.deserialize(unpacked);
 
             if (typeof this.data !== 'object' || this.data === null) {
                 throw new Error('Invalid deserialized data');
@@ -2393,7 +2700,7 @@ class Document {
     }
 
     packSync() {
-        let packed = serializer.serialize(this.data);
+        let packed = this._serializer.serialize(this.data);
         if (this._compressed) {
             packed = this._compression.compressSync(packed);
         }
@@ -2409,7 +2716,7 @@ class Document {
         if (this._compressed) {
             unpacked = this._compression.decompressSync(unpacked);
         }
-        this.data = serializer.deserialize(unpacked);
+        this.data = this._serializer.deserialize(unpacked);
         return this.data;
     }
 
@@ -2446,104 +2753,269 @@ class Document {
 // ========================
 
 class CollectionMetadata {
-    constructor(name, data = {}) {
+    constructor(name, data = {}, serializer, base64, dbName) {
         this.name = name;
+        this._serializer = serializer;
+        this._base64 = base64;
+        this._dbName = dbName;
+        this._storageKey = dbName ? `lacertadb_${dbName}_${name}_collmeta` : null;
+
+        // Aggregate stats
         this.sizeKB = data.sizeKB || 0;
         this.length = data.length || 0;
         this.createdAt = data.createdAt || Date.now();
         this.modifiedAt = data.modifiedAt || Date.now();
-        // Removed detailed per-doc tracking to save space
-        this.documentSizes = {};
-        this.documentModifiedAt = {};
-        this.documentPermanent = {};
-        this.documentAttachments = {};
+
+        // Per-document tracking (in-memory Maps for O(1) ops)
+        this._docSizes = new Map(data._docSizes || []);        // docId -> sizeKB
+        this._docModified = new Map(data._docModified || []);   // docId -> timestamp
+        this._docPermanent = new Map(data._docPermanent || []); // docId -> boolean
+        this._docAttachments = new Map(data._docAttachments || []); // docId -> count
+
+        // Debounced persistence
+        this._dirty = false;
+        this._saveTimer = null;
+
+        // Safety: flush on page unload
+        this._flushHandler = () => this._flushSync();
+        if (typeof window !== 'undefined') {
+            window.addEventListener('beforeunload', this._flushHandler);
+        }
     }
 
-    addDocument(docId, sizeKB, isPermanent, attachmentCount) {
-        // Optimization: Don't store detailed map in LS to avoid QuotaExceeded
-        // this.documentSizes[docId] = sizeKB;
+    // ---- Mutations (in-memory only, schedule async save) ----
+
+    addDocument(docId, sizeKB, isPermanent = false, attachmentCount = 0) {
+        this._docSizes.set(docId, sizeKB);
+        this._docModified.set(docId, Date.now());
+        this._docPermanent.set(docId, isPermanent);
+        this._docAttachments.set(docId, attachmentCount);
+
         this.sizeKB += sizeKB;
         this.length++;
         this.modifiedAt = Date.now();
+        this._scheduleSave();
     }
 
-    updateDocument(docId, newSizeKB, isPermanent, attachmentCount) {
-        // Approximate tracking
-        // const oldSize = this.documentSizes[docId] || 0;
-        // this.sizeKB = this.sizeKB - oldSize + newSizeKB;
+    updateDocument(docId, newSizeKB, isPermanent = false, attachmentCount = 0) {
+        const oldSize = this._docSizes.get(docId) || 0;
+        this.sizeKB = this.sizeKB - oldSize + newSizeKB;
+
+        this._docSizes.set(docId, newSizeKB);
+        this._docModified.set(docId, Date.now());
+        this._docPermanent.set(docId, isPermanent);
+        this._docAttachments.set(docId, attachmentCount);
+
         this.modifiedAt = Date.now();
+        this._scheduleSave();
     }
 
     removeDocument(docId) {
-        // const sizeKB = this.documentSizes[docId] || 0;
-        // this.sizeKB -= sizeKB;
-        // this.length--;
+        const sizeKB = this._docSizes.get(docId) || 0;
+        this.sizeKB -= sizeKB;
+        this.length--;
+
+        this._docSizes.delete(docId);
+        this._docModified.delete(docId);
+        this._docPermanent.delete(docId);
+        this._docAttachments.delete(docId);
+
         this.modifiedAt = Date.now();
+        this._scheduleSave();
     }
 
+    // ---- Queries (instant from memory) ----
+
     getOldestNonPermanentDocuments(count) {
-        // If we removed the maps, we can't do this efficiently from metadata alone.
-        // Should query DB index 'modified' instead.
-        return []; 
+        const candidates = [];
+        for (const [docId, modified] of this._docModified) {
+            if (!this._docPermanent.get(docId)) {
+                candidates.push({ id: docId, modified });
+            }
+        }
+        candidates.sort((a, b) => a.modified - b.modified);
+        return candidates.slice(0, count).map(c => c.id);
+    }
+
+    getDocumentSize(docId) {
+        return this._docSizes.get(docId) || 0;
+    }
+
+    isDocumentPermanent(docId) {
+        return this._docPermanent.get(docId) || false;
+    }
+
+    hasDocument(docId) {
+        return this._docSizes.has(docId);
+    }
+
+    // ---- Aggregate snapshot (for DatabaseMetadata) ----
+
+    getAggregateSnapshot() {
+        return {
+            sizeKB: this.sizeKB,
+            length: this.length,
+            createdAt: this.createdAt,
+            modifiedAt: this.modifiedAt
+        };
+    }
+
+    // ---- Persistence ----
+
+    _scheduleSave() {
+        this._dirty = true;
+        if (this._saveTimer) return;
+
+        const save = () => {
+            this._saveTimer = null;
+            if (!this._dirty) return;
+            this._persistToStorage();
+        };
+
+        if (typeof window !== 'undefined' && window.requestIdleCallback) {
+            this._saveTimer = window.requestIdleCallback(save);
+        } else {
+            this._saveTimer = setTimeout(save, 300);
+        }
+    }
+
+    _flushSync() {
+        if (!this._dirty) return;
+        this._persistToStorage();
+    }
+
+    _persistToStorage() {
+        if (!this._storageKey || !this._serializer || !this._base64) return;
+        try {
+            const dataToStore = {
+                sizeKB: this.sizeKB,
+                length: this.length,
+                createdAt: this.createdAt,
+                modifiedAt: this.modifiedAt,
+                _docSizes: Array.from(this._docSizes.entries()),
+                _docModified: Array.from(this._docModified.entries()),
+                _docPermanent: Array.from(this._docPermanent.entries()),
+                _docAttachments: Array.from(this._docAttachments.entries())
+            };
+            const serialized = this._serializer.serialize(dataToStore);
+            const encoded = this._base64.encode(serialized);
+            localStorage.setItem(this._storageKey, encoded);
+            this._dirty = false;
+        } catch (e) {
+            if (e.name === 'QuotaExceededError') {
+                // Fallback: persist only aggregate stats (drop per-doc maps)
+                console.warn('CollectionMetadata: quota exceeded, saving aggregates only');
+                try {
+                    const fallback = {
+                        sizeKB: this.sizeKB,
+                        length: this.length,
+                        createdAt: this.createdAt,
+                        modifiedAt: this.modifiedAt
+                    };
+                    const serialized = this._serializer.serialize(fallback);
+                    const encoded = this._base64.encode(serialized);
+                    localStorage.setItem(this._storageKey, encoded);
+                    this._dirty = false;
+                } catch (e2) {
+                    console.error('CollectionMetadata: fallback save also failed:', e2);
+                }
+            } else {
+                console.error('CollectionMetadata save failed:', e);
+            }
+        }
+    }
+
+    static load(dbName, collName, serializer, base64) {
+        const key = `lacertadb_${dbName}_${collName}_collmeta`;
+        const stored = localStorage.getItem(key);
+        if (stored) {
+            try {
+                const decoded = base64.decode(stored);
+                const data = serializer.deserialize(decoded);
+                return new CollectionMetadata(collName, data, serializer, base64, dbName);
+            } catch (e) {
+                console.warn('CollectionMetadata corrupted, resetting:', e);
+            }
+        }
+        return new CollectionMetadata(collName, {}, serializer, base64, dbName);
+    }
+
+    // ---- Lifecycle ----
+
+    destroy() {
+        this._flushSync();
+        if (typeof window !== 'undefined' && this._flushHandler) {
+            window.removeEventListener('beforeunload', this._flushHandler);
+            this._flushHandler = null;
+        }
+        if (this._saveTimer) {
+            if (typeof window !== 'undefined' && window.cancelIdleCallback) {
+                window.cancelIdleCallback(this._saveTimer);
+            } else {
+                clearTimeout(this._saveTimer);
+            }
+            this._saveTimer = null;
+        }
+    }
+
+    clear() {
+        this.sizeKB = 0;
+        this.length = 0;
+        this.modifiedAt = Date.now();
+        this._docSizes.clear();
+        this._docModified.clear();
+        this._docPermanent.clear();
+        this._docAttachments.clear();
+        this._dirty = true;
+        this._flushSync();
     }
 }
 
 class DatabaseMetadata {
-    constructor(name, data = {}) {
+    constructor(name, data = {}, serializer, base64) {
         this.name = name;
+        this._serializer = serializer;
+        this._base64 = base64;
         this.collections = data.collections || {};
         this.totalSizeKB = data.totalSizeKB || 0;
         this.totalLength = data.totalLength || 0;
         this.modifiedAt = data.modifiedAt || Date.now();
+
+        // Debounced persistence
+        this._dirty = false;
+        this._saveTimer = null;
+
+        this._flushHandler = () => this._flushSync();
+        if (typeof window !== 'undefined') {
+            window.addEventListener('beforeunload', this._flushHandler);
+        }
     }
 
-    static load(dbName) {
+    static load(dbName, serializer, base64) {
         const key = `lacertadb_${dbName}_metadata`;
         const stored = localStorage.getItem(key);
         if (stored) {
             try {
                 const decoded = base64.decode(stored);
                 const data = serializer.deserialize(decoded);
-                return new DatabaseMetadata(dbName, data);
+                return new DatabaseMetadata(dbName, data, serializer, base64);
             } catch (e) {
                 console.error('Failed to load metadata:', e);
             }
         }
-        return new DatabaseMetadata(dbName);
-    }
-
-    save() {
-        const key = `lacertadb_${this.name}_metadata`;
-        try {
-            const dataToStore = {
-                collections: this.collections,
-                totalSizeKB: this.totalSizeKB,
-                totalLength: this.totalLength,
-                modifiedAt: this.modifiedAt
-            };
-            const serializedData = serializer.serialize(dataToStore);
-            const encodedData = base64.encode(serializedData);
-            localStorage.setItem(key, encodedData);
-        } catch (e) {
-            // Ignore quota errors here to prevent crash
-        }
+        return new DatabaseMetadata(dbName, {}, serializer, base64);
     }
 
     setCollection(collectionMetadata) {
-        this.collections[collectionMetadata.name] = {
-            sizeKB: collectionMetadata.sizeKB,
-            length: collectionMetadata.length,
-            createdAt: collectionMetadata.createdAt,
-            modifiedAt: collectionMetadata.modifiedAt
-        };
+        this.collections[collectionMetadata.name] = collectionMetadata.getAggregateSnapshot();
         this._recalculate();
-        this.save();
+        this._scheduleSave();
     }
 
     removeCollection(collectionName) {
         delete this.collections[collectionName];
         this._recalculate();
-        this.save();
+        this._scheduleSave();
     }
 
     _recalculate() {
@@ -2556,42 +3028,128 @@ class DatabaseMetadata {
         }
         this.modifiedAt = Date.now();
     }
+
+    // ---- Debounced persistence ----
+
+    _scheduleSave() {
+        this._dirty = true;
+        if (this._saveTimer) return;
+
+        const save = () => {
+            this._saveTimer = null;
+            if (!this._dirty) return;
+            this._persistToStorage();
+        };
+
+        if (typeof window !== 'undefined' && window.requestIdleCallback) {
+            this._saveTimer = window.requestIdleCallback(save);
+        } else {
+            this._saveTimer = setTimeout(save, 300);
+        }
+    }
+
+    _flushSync() {
+        if (!this._dirty) return;
+        this._persistToStorage();
+    }
+
+    _persistToStorage() {
+        const key = `lacertadb_${this.name}_metadata`;
+        try {
+            const dataToStore = {
+                collections: this.collections,
+                totalSizeKB: this.totalSizeKB,
+                totalLength: this.totalLength,
+                modifiedAt: this.modifiedAt
+            };
+            const serializedData = this._serializer.serialize(dataToStore);
+            const encodedData = this._base64.encode(serializedData);
+            localStorage.setItem(key, encodedData);
+            this._dirty = false;
+        } catch (e) {
+            if (e.name === 'QuotaExceededError') {
+                console.error('CRITICAL: LocalStorage quota exceeded. Metadata not saved for db:', this.name);
+                if (typeof window !== 'undefined') {
+                    window.dispatchEvent(new CustomEvent('lacertadb:quotaexceeded', { detail: { db: this.name } }));
+                }
+            } else {
+                console.error('Failed to save metadata:', e);
+            }
+        }
+    }
+
+    // Force immediate save (for critical operations like clearAll)
+    save() {
+        this._dirty = true;
+        this._flushSync();
+    }
+
+    // ---- Lifecycle ----
+
+    destroy() {
+        this._flushSync();
+        if (typeof window !== 'undefined' && this._flushHandler) {
+            window.removeEventListener('beforeunload', this._flushHandler);
+            this._flushHandler = null;
+        }
+        if (this._saveTimer) {
+            if (typeof window !== 'undefined' && window.cancelIdleCallback) {
+                window.cancelIdleCallback(this._saveTimer);
+            } else {
+                clearTimeout(this._saveTimer);
+            }
+            this._saveTimer = null;
+        }
+    }
 }
 
 class Settings {
-    constructor(dbName, data = {}) {
+    constructor(dbName, data = {}, serializer, base64) {
         this.dbName = dbName;
+        this._serializer = serializer;
+        this._base64 = base64;
         this.sizeLimitKB = data.sizeLimitKB != null ? data.sizeLimitKB : Infinity;
         const defaultBuffer = this.sizeLimitKB === Infinity ? Infinity : this.sizeLimitKB * 0.8;
         this.bufferLimitKB = data.bufferLimitKB != null ? data.bufferLimitKB : defaultBuffer;
         this.freeSpaceEvery = this.sizeLimitKB === Infinity ? 0 : (data.freeSpaceEvery || 10000);
     }
 
-    static load(dbName) {
+    static load(dbName, serializer, base64) {
         const key = `lacertadb_${dbName}_settings`;
         const stored = localStorage.getItem(key);
         if (stored) {
             try {
                 const decoded = base64.decode(stored);
                 const data = serializer.deserialize(decoded);
-                return new Settings(dbName, data);
+                return new Settings(dbName, data, serializer, base64);
             } catch (e) {
                 console.error('Failed to load settings:', e);
             }
         }
-        return new Settings(dbName);
+        return new Settings(dbName, {}, serializer, base64);
     }
 
     save() {
         const key = `lacertadb_${this.dbName}_settings`;
-        const dataToStore = {
-            sizeLimitKB: this.sizeLimitKB,
-            bufferLimitKB: this.bufferLimitKB,
-            freeSpaceEvery: this.freeSpaceEvery
-        };
-        const serializedData = serializer.serialize(dataToStore);
-        const encodedData = base64.encode(serializedData);
-        localStorage.setItem(key, encodedData);
+        try {
+            const dataToStore = {
+                sizeLimitKB: this.sizeLimitKB,
+                bufferLimitKB: this.bufferLimitKB,
+                freeSpaceEvery: this.freeSpaceEvery
+            };
+            const serializedData = this._serializer.serialize(dataToStore);
+            const encodedData = this._base64.encode(serializedData);
+            localStorage.setItem(key, encodedData);
+        } catch (e) {
+            if (e.name === 'QuotaExceededError') {
+                console.error('CRITICAL: Settings save failed — localStorage quota exceeded');
+                if (typeof window !== 'undefined') {
+                    window.dispatchEvent(new CustomEvent('lacertadb:quotaexceeded', { detail: { source: 'settings', db: this.dbName } }));
+                }
+            } else {
+                console.error('Settings save failed:', e);
+            }
+        }
     }
 
     updateSettings(newSettings) {
@@ -2732,10 +3290,40 @@ class AggregationPipeline {
                 const groups = new Map();
                 const idField = groupSpec._id;
 
+                // Helper: recursively sort object keys for stable JSON serialization
+                const stableStringify = (obj) => {
+                    if (obj === null || typeof obj !== 'object') return JSON.stringify(obj);
+                    if (Array.isArray(obj)) return '[' + obj.map(stableStringify).join(',') + ']';
+                    const sorted = Object.keys(obj).sort();
+                    return '{' + sorted.map(k => JSON.stringify(k) + ':' + stableStringify(obj[k])).join(',') + '}';
+                };
+
+                // Helper: resolve $field references in an _id expression object
+                const resolveIdValue = (doc, idExpr) => {
+                    if (typeof idExpr === 'string' && idExpr.startsWith('$')) {
+                        return queryEngine.getFieldValue(doc, idExpr.substring(1));
+                    }
+                    if (idExpr !== null && typeof idExpr === 'object' && !Array.isArray(idExpr)) {
+                        const resolved = {};
+                        for (const key in idExpr) {
+                            resolved[key] = resolveIdValue(doc, idExpr[key]);
+                        }
+                        return resolved;
+                    }
+                    return idExpr;
+                };
+
                 for (const doc of docs) {
-                    const groupKey = typeof idField === 'string' ?
-                        queryEngine.getFieldValue(doc, idField.replace('$', '')) :
-                        JSON.stringify(idField);
+                    let groupKey;
+                    if (typeof idField === 'string') {
+                        groupKey = idField.startsWith('$')
+                            ? queryEngine.getFieldValue(doc, idField.substring(1))
+                            : idField;
+                    } else if (idField !== null && typeof idField === 'object') {
+                        groupKey = stableStringify(resolveIdValue(doc, idField));
+                    } else {
+                        groupKey = idField; // null or literal
+                    }
 
                     if (!groups.has(groupKey)) {
                         groups.set(groupKey, { _id: groupKey, docs: [] });
@@ -2999,6 +3587,8 @@ class Collection {
     constructor(name, database) {
         this.name = name;
         this.database = database;
+        this._serializer = database._serializer;
+        this._base64 = database._base64;
         this._db = null;
         this._metadata = null;
         this._settings = database.settings;
@@ -3042,8 +3632,10 @@ class Collection {
             }
         });
 
-        const metadataData = this.database.metadata.collections[this.name];
-        this._metadata = new CollectionMetadata(this.name, metadataData);
+        // Load per-collection metadata (with per-doc tracking) from its own localStorage key
+        this._metadata = CollectionMetadata.load(
+            this.database.name, this.name, this._serializer, this._base64
+        );
 
         await this._indexManager.loadIndexMetadata();
 
@@ -3091,7 +3683,7 @@ class Collection {
         const doc = new Document({data: documentData, _id: options.id}, {
             compressed: options.compressed !== false,
             permanent: options.permanent || false
-        });
+        }, this._serializer);
 
         const attachments = options.attachments;
         if (attachments && attachments.length > 0) {
@@ -3133,7 +3725,7 @@ class Collection {
         const doc = new Document(stored, {
             encrypted: stored._encrypted,
             compressed: stored._compressed
-        });
+        }, this._serializer);
 
         if (stored.packedData) {
             await doc.unpack(this.database.encryption);
@@ -3156,7 +3748,7 @@ class Collection {
                 const doc = new Document(docData, {
                     encrypted: docData._encrypted,
                     compressed: docData._compressed
-                });
+                }, this._serializer);
                 if (docData.packedData) {
                     await doc.unpack(this.database.encryption);
                 }
@@ -3178,7 +3770,7 @@ class Collection {
             throw new LacertaDBError(`Document with id '${docId}' not found for update.`, 'DOCUMENT_NOT_FOUND');
         }
 
-        const existingDoc = new Document(stored);
+        const existingDoc = new Document(stored, {}, this._serializer);
         if (stored.packedData) await existingDoc.unpack(this.database.encryption);
 
         const oldDocOutput = existingDoc.objectOutput();
@@ -3191,7 +3783,7 @@ class Collection {
         }, {
             compressed: options.compressed !== undefined ? options.compressed : stored._compressed,
             permanent: options.permanent !== undefined ? options.permanent : stored._permanent
-        });
+        }, this._serializer);
         doc._modified = Date.now();
 
         const attachments = options.attachments;
@@ -3266,7 +3858,7 @@ class Collection {
 
         const startTime = performance.now();
 
-        const cacheKey = base64.encode(serializer.serialize({filter, options}));
+        const cacheKey = this._base64.encode(this._serializer.serialize({filter, options}));
         const cached = this._cacheStrategy.get(cacheKey);
 
         if (cached) {
@@ -3336,7 +3928,7 @@ class Collection {
             const doc = new Document({data: documentData}, {
                 compressed: options.compressed !== false,
                 permanent: options.permanent || false
-            });
+            }, this._serializer);
 
             await doc.pack(this.database.encryption);
             operations.push({
@@ -3370,31 +3962,145 @@ class Collection {
         }));
     }
 
-    async batchUpdate(updates, options) {
+    async batchUpdate(updates, options = {}) {
         if (!this._initialized) await this.init();
 
-        return Promise.all(updates.map(update =>
-            this.update(update.id, update.data, options)
-                .then(id => ({success: true, id}))
-                .catch(error => ({success: false, id: update.id, error: error.message}))
-        ));
+        const startTime = performance.now();
+        const operations = [];
+        const oldDocs = [];
+        const newDocs = [];
+        const skipped = [];
+
+        // Phase 1: Read all existing docs and prepare put operations
+        for (const update of updates) {
+            const stored = await this._indexedDB.get(this._db, 'documents', update.id);
+            if (!stored) {
+                skipped.push({ success: false, id: update.id, error: 'Document not found' });
+                continue;
+            }
+
+            const existingDoc = new Document(stored, {}, this._serializer);
+            if (stored.packedData) await existingDoc.unpack(this.database.encryption);
+
+            oldDocs.push(existingDoc.objectOutput());
+
+            const updatedData = { ...existingDoc.data, ...update.data };
+            const doc = new Document({
+                _id: update.id,
+                _created: stored._created,
+                data: updatedData
+            }, {
+                compressed: options.compressed !== undefined ? options.compressed : stored._compressed,
+                permanent: options.permanent !== undefined ? options.permanent : stored._permanent
+            }, this._serializer);
+            doc._modified = Date.now();
+            doc._attachments = stored._attachments;
+
+            await doc.pack(this.database.encryption);
+            newDocs.push(doc);
+
+            operations.push({
+                type: 'put',
+                data: doc.databaseOutput()
+            });
+        }
+
+        if (operations.length === 0) return skipped;
+
+        // Phase 2: Single-transaction write
+        const dbResults = await this._indexedDB.batchOperation(this._db, operations);
+
+        // Phase 3: Update indexes and metadata post-transaction
+        for (let i = 0; i < newDocs.length; i++) {
+            if (dbResults[i].success) {
+                const doc = newDocs[i];
+                await this._indexManager.updateIndexForDocument(doc._id, oldDocs[i], doc.objectOutput());
+
+                const sizeKB = doc._packedData.byteLength / 1024;
+                this._metadata.updateDocument(doc._id, sizeKB, doc._permanent, doc._attachments.length);
+            }
+        }
+
+        this.database.metadata.setCollection(this._metadata);
+        this._cacheStrategy.clear();
+
+        if (this._performanceMonitor) {
+            this._performanceMonitor.recordOperation('batchUpdate', performance.now() - startTime);
+        }
+
+        return [
+            ...dbResults.map((r, i) => ({ ...r, id: newDocs[i]._id })),
+            ...skipped
+        ];
     }
 
     async batchDelete(items) {
         if (!this._initialized) await this.init();
 
+        const startTime = performance.now();
         const normalizedItems = items.map(item => {
             if (typeof item === 'string') {
-                return {id: item, options: {}};
+                return { id: item, options: {} };
             }
-            return {id: item.id, options: item.options || {}};
+            return { id: item.id, options: item.options || {} };
         });
 
-        return Promise.all(normalizedItems.map(({id, options}) =>
-            this.delete(id, options)
-                .then(() => ({success: true, id}))
-                .catch(error => ({success: false, id, error: error.message}))
-        ));
+        const operations = [];
+        const docsToRemove = [];
+        const skipped = [];
+
+        // Phase 1: Validate all documents and prepare delete operations
+        for (const { id, options } of normalizedItems) {
+            const doc = await this._indexedDB.get(this._db, 'documents', id);
+            if (!doc) {
+                skipped.push({ success: false, id, error: 'Document not found' });
+                continue;
+            }
+
+            if (doc._permanent && !options.force) {
+                skipped.push({ success: false, id, error: 'Cannot delete permanent document without force flag' });
+                continue;
+            }
+
+            const fullDoc = await this.get(id);
+            docsToRemove.push({ id, fullDoc, stored: doc });
+
+            operations.push({
+                type: 'delete',
+                key: id
+            });
+        }
+
+        if (operations.length === 0) return skipped;
+
+        // Phase 2: Single-transaction delete
+        const dbResults = await this._indexedDB.batchOperation(this._db, operations);
+
+        // Phase 3: Update indexes, OPFS cleanup, and metadata post-transaction
+        for (let i = 0; i < docsToRemove.length; i++) {
+            if (dbResults[i].success) {
+                const { id, fullDoc, stored } = docsToRemove[i];
+                await this._indexManager.updateIndexForDocument(id, fullDoc, null);
+
+                if (stored._attachments && stored._attachments.length > 0) {
+                    await this._opfs.deleteAttachments(this.database.name, this.name, id);
+                }
+
+                this._metadata.removeDocument(id);
+            }
+        }
+
+        this.database.metadata.setCollection(this._metadata);
+        this._cacheStrategy.clear();
+
+        if (this._performanceMonitor) {
+            this._performanceMonitor.recordOperation('batchDelete', performance.now() - startTime);
+        }
+
+        return [
+            ...dbResults.map((r, i) => ({ ...r, id: docsToRemove[i].id })),
+            ...skipped
+        ];
     }
 
     async _checkSpaceLimit() {
@@ -3442,7 +4148,11 @@ class Collection {
             await this._indexedDB.clear(this._db, 'documents');
 
             // Reset metadata
-            this._metadata = new CollectionMetadata(this.name);
+            if (this._metadata) this._metadata.destroy();
+            this._metadata = new CollectionMetadata(
+                this.name, {}, this._serializer, this._base64, this.database.name
+            );
+            this._metadata._flushSync();
             this.database.metadata.setCollection(this._metadata);
 
             // Clear cache
@@ -3470,6 +4180,11 @@ class Collection {
     }
 
     destroy() {
+        // Flush and destroy collection metadata
+        if (this._metadata) {
+            this._metadata.destroy();
+        }
+
         // Clear the cleanup interval
         if (this._cleanupInterval) {
             clearInterval(this._cleanupInterval);
@@ -3498,13 +4213,15 @@ class Collection {
 // ========================
 
 class Database {
-    constructor(name, performanceMonitor) {
+    constructor(name, performanceMonitor, serializer, base64) {
         this.name = name;
         this._collections = new Map();
         this._metadata = null;
         this._settings = null;
         this._quickStore = null;
         this._performanceMonitor = performanceMonitor;
+        this._serializer = serializer;
+        this._base64 = base64;
 
         // Database-level encryption
         this._encryption = null;
@@ -3539,9 +4256,9 @@ class Database {
     }
 
     async init(options = {}) {
-        this._metadata = DatabaseMetadata.load(this.name);
-        this._settings = Settings.load(this.name);
-        this._quickStore = new QuickStore(this.name);
+        this._metadata = DatabaseMetadata.load(this.name, this._serializer, this._base64);
+        this._settings = Settings.load(this.name, this._serializer, this._base64);
+        this._quickStore = new QuickStore(this.name, this._serializer, this._base64);
 
         if (options.pin) {
             await this._initializeEncryption(options.pin, options.salt, options.encryptionConfig);
@@ -3554,18 +4271,18 @@ class Database {
         const encMetaKey = `lacertadb_${this.name}_encryption`;
         let existingMetadata = null;
         const stored = localStorage.getItem(encMetaKey);
-        
+
         if (stored) {
-            const decoded = base64.decode(stored);
-            existingMetadata = serializer.deserialize(decoded);
+            const decoded = this._base64.decode(stored);
+            existingMetadata = this._serializer.deserialize(decoded);
         }
 
-        this._encryption = new SecureDatabaseEncryption(config);
+        this._encryption = new SecureDatabaseEncryption(config, this._serializer, this._base64);
         const newMeta = await this._encryption.initialize(pin, existingMetadata);
 
         if (!existingMetadata) {
-            const serialized = serializer.serialize(newMeta);
-            const encoded = base64.encode(serialized);
+            const serialized = this._serializer.serialize(newMeta);
+            const encoded = this._base64.encode(serialized);
             localStorage.setItem(encMetaKey, encoded);
         }
     }
@@ -3578,8 +4295,8 @@ class Database {
         const newMeta = await this._encryption.changePin(oldPin, newPin);
 
         const encMetaKey = `lacertadb_${this.name}_encryption`;
-        const serialized = serializer.serialize(newMeta);
-        const encoded = base64.encode(serialized);
+        const serialized = this._serializer.serialize(newMeta);
+        const encoded = this._base64.encode(serialized);
         localStorage.setItem(encMetaKey, encoded);
 
         return true;
@@ -3637,7 +4354,9 @@ class Database {
         this._collections.set(name, collection);
 
         if (!this._metadata.collections[name]) {
-            this._metadata.setCollection(new CollectionMetadata(name));
+            this._metadata.setCollection(new CollectionMetadata(
+                name, {}, this._serializer, this._base64, this.name
+            ));
         }
         return collection;
     }
@@ -3670,6 +4389,10 @@ class Database {
         }
 
         this._metadata.removeCollection(name);
+
+        // Clean up collection-level metadata and index localStorage keys
+        localStorage.removeItem(`lacertadb_${this.name}_${name}_collmeta`);
+        localStorage.removeItem(`lacertadb_${this.name}_${name}_indexes`);
 
         const dbName = `${this.name}_${name}`;
         await new Promise((resolve, reject) => {
@@ -3705,7 +4428,7 @@ class Database {
 
     async export(format = 'json', password = null) {
         const data = {
-            version: '0.9.2',
+            version: '0.10.2',
             database: this.name,
             timestamp: Date.now(),
             collections: {}
@@ -3717,14 +4440,14 @@ class Database {
         }
 
         if (format === 'json') {
-            const serialized = serializer.serialize(data);
-            return base64.encode(serialized);
+            const serialized = this._serializer.serialize(data);
+            return this._base64.encode(serialized);
         }
         if (format === 'encrypted' && password) {
             const encryption = new BrowserEncryptionUtility();
-            const serializedData = serializer.serialize(data);
+            const serializedData = this._serializer.serialize(data);
             const encrypted = await encryption.encrypt(serializedData, password);
-            return base64.encode(encrypted);
+            return this._base64.encode(encrypted);
         }
         throw new LacertaDBError(`Unsupported export format: ${format}`, 'INVALID_FORMAT');
     }
@@ -3732,13 +4455,13 @@ class Database {
     async import(data, format = 'json', password = null) {
         let parsed;
         try {
-            const decoded = base64.decode(data);
+            const decoded = this._base64.decode(data);
             if (format === 'encrypted' && password) {
                 const encryption = new BrowserEncryptionUtility();
                 const decrypted = await encryption.decrypt(decoded, password);
-                parsed = serializer.deserialize(decrypted);
+                parsed = this._serializer.deserialize(decrypted);
             } else {
-                parsed = serializer.deserialize(decoded);
+                parsed = this._serializer.deserialize(decoded);
             }
         } catch (e) {
             throw new LacertaDBError('Failed to parse import data', 'IMPORT_PARSE_FAILED', e);
@@ -3769,7 +4492,8 @@ class Database {
     async clearAll() {
         await Promise.all([...this._collections.keys()].map(name => this.dropCollection(name)));
         this._collections.clear();
-        this._metadata = new DatabaseMetadata(this.name);
+        if (this._metadata) this._metadata.destroy();
+        this._metadata = new DatabaseMetadata(this.name, {}, this._serializer, this._base64);
         this._metadata.save();
         this._quickStore.clear();
     }
@@ -3787,6 +4511,11 @@ class Database {
         // Clear quickstore
         if (this._quickStore) {
             this._quickStore.destroy();
+        }
+
+        // Destroy database metadata
+        if (this._metadata) {
+            this._metadata.destroy();
         }
 
         // Destroy encryption
@@ -3807,18 +4536,31 @@ class Database {
 // ========================
 
 class LacertaDB {
-    constructor() {
+    constructor(config = {}) {
         this._databases = new Map();
         this._performanceMonitor = new PerformanceMonitor();
+
+        // Instantiate serializer with user-overridable config merged over defaults
+        const serialConfig = { ...TURBO_SERIAL_DEFAULTS, ...(config.turboSerial || {}) };
+        this._serializer = new TurboSerial(serialConfig);
+        this._base64 = new TurboBase64();
     }
 
     get performanceMonitor() {
         return this._performanceMonitor;
     }
 
+    get serializer() {
+        return this._serializer;
+    }
+
+    get base64() {
+        return this._base64;
+    }
+
     async getDatabase(name, options = {}) {
         if (!this._databases.has(name)) {
-            const db = new Database(name, this._performanceMonitor);
+            const db = new Database(name, this._performanceMonitor, this._serializer, this._base64);
             await db.init(options);
             this._databases.set(name, db);
         }
@@ -3842,7 +4584,7 @@ class LacertaDB {
         });
 
         // Clean up quickstore
-        const quickStore = new QuickStore(name);
+        const quickStore = new QuickStore(name, this._serializer, this._base64);
         quickStore.clear();
 
         // Clean up all collections and indexes
@@ -3872,7 +4614,7 @@ class LacertaDB {
 
     async createBackup(password = null) {
         const backup = {
-            version: '0.9.2',
+            version: '0.10.2',
             timestamp: Date.now(),
             databases: {}
         };
@@ -3880,29 +4622,29 @@ class LacertaDB {
         for (const dbName of this.listDatabases()) {
             const db = await this.getDatabase(dbName);
             const exported = await db.export('json');
-            const decoded = base64.decode(exported);
-            backup.databases[dbName] = serializer.deserialize(decoded);
+            const decoded = this._base64.decode(exported);
+            backup.databases[dbName] = this._serializer.deserialize(decoded);
         }
 
-        const serializedBackup = serializer.serialize(backup);
+        const serializedBackup = this._serializer.serialize(backup);
         if (password) {
             const encryption = new BrowserEncryptionUtility();
             const encrypted = await encryption.encrypt(serializedBackup, password);
-            return base64.encode(encrypted);
+            return this._base64.encode(encrypted);
         }
-        return base64.encode(serializedBackup);
+        return this._base64.encode(serializedBackup);
     }
 
     async restoreBackup(backupData, password = null) {
         let backup;
         try {
-            let decodedData = base64.decode(backupData);
+            let decodedData = this._base64.decode(backupData);
             if (password) {
                 const encryption = new BrowserEncryptionUtility();
                 const decrypted = await encryption.decrypt(decodedData, password);
-                backup = serializer.deserialize(decrypted);
+                backup = this._serializer.deserialize(decrypted);
             } else {
-                backup = serializer.deserialize(decodedData);
+                backup = this._serializer.deserialize(decodedData);
             }
         } catch (e) {
             throw new LacertaDBError('Failed to parse backup data', 'BACKUP_PARSE_FAILED', e);
@@ -3911,7 +4653,7 @@ class LacertaDB {
         const results = { databases: 0, collections: 0, documents: 0 };
         for (const [dbName, dbData] of Object.entries(backup.databases)) {
             const db = await this.getDatabase(dbName);
-            const encodedDbData = base64.encode(serializer.serialize(dbData));
+            const encodedDbData = this._base64.encode(this._serializer.serialize(dbData));
             const importResult = await db.import(encodedDbData);
 
             results.databases++;
