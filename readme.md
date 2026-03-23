@@ -2,7 +2,7 @@
   <img src="https://raw.githubusercontent.com/pixagram-blockchain/LacertaDB/main/logo.webp?raw=true" alt="LacertaDB Logo" width="200"/>
 </p>
 
-<h1 align="center">LacertaDB 0.11.0</h1>
+<h1 align="center">LacertaDB 0.11.2</h1>
 
 <p align="center">
   <strong>A high-performance, browser-native document database with encryption, indexing, and MongoDB-like queries.</strong>

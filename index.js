@@ -1,7 +1,7 @@
 /**
- * LacertaDB V0.11.1 - Production Library
+ * LacertaDB V0.11.2 - Production Library
  * @module LacertaDB
- * @version 0.11.1
+ * @version 0.11.2
  * @license MIT
  * @author Pixagram SA
  */
@@ -28,15 +28,15 @@ import TurboBase64 from "@pixagram/turbobase64";
 
 // Default TurboSerial configuration (overridable via LacertaDB constructor)
 const TURBO_SERIAL_DEFAULTS = {
-    compression: true,
-    preservePropertyDescriptors: true,
+    compression: false,
+    preservePropertyDescriptors: false,
     deduplication: false,
     simdOptimization: true,
-    detectCircular: true,
-    shareArrayBuffers: true,
+    detectCircular: false,
+    shareArrayBuffers: false,
     allowFunction: false,
     serializeFunctions: false,
-    memoryPoolSize: 65536 * 16
+    memoryPoolSize: 65536
 };
 
 // ========================
