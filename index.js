@@ -2491,6 +2491,8 @@ class IndexManager {
             const decoded = this._base64.decode(stored);
             const metadata = this._serializer.deserialize(decoded);
 
+            if (!metadata || !Array.isArray(metadata.indexes)) return;
+
             for (const indexDef of metadata.indexes) {
                 const { name, ...index } = indexDef;
                 this._indexes.set(name, index);
@@ -3197,6 +3199,7 @@ class DatabaseMetadata {
         this.name = name;
         this._serializer = serializer;
         this._base64 = base64;
+        if (!data || typeof data !== 'object') data = {};
         this.collections = data.collections || {};
         this.totalSizeKB = data.totalSizeKB || 0;
         this.totalLength = data.totalLength || 0;
@@ -3219,7 +3222,10 @@ class DatabaseMetadata {
             try {
                 const decoded = base64.decode(stored);
                 const data = serializer.deserialize(decoded);
-                return new DatabaseMetadata(dbName, data, serializer, base64);
+                if (data && typeof data === 'object') {
+                    return new DatabaseMetadata(dbName, data, serializer, base64);
+                }
+                // Corrupted/stale — fall through to fresh metadata
             } catch (e) {
                 console.error('Failed to load metadata:', e);
             }
