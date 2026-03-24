@@ -1,9 +1,10 @@
 {
   "name": "@pixagram/lacerta-db",
-  "version": "0.12.3",
+  "version": "0.12.4",
   "description": "Lacerta-DB is a Javascript IndexedDB Database for Web Browsers. Simple, Fast, Secure.",
   "devDependencies": {
     "@babel/core": "^7.23.6",
+    "@babel/plugin-transform-optional-chaining": "^7.28.6",
     "@babel/preset-env": "^7.23.6",
     "babel-loader": "~8.3.0",
     "clean-jsdoc-theme": "^4.3.0",
@@ -15,7 +16,7 @@
   },
   "dependencies": {
     "@pixagram/turbobase64": "~0.0.2",
-    "@pixagram/turboserial": "~0.2.2"
+    "@pixagram/turboserial": "~0.3.0"
   },
   "build": {},
   "author": "Affolter Matias",
@@ -39,7 +40,7 @@
   ],
   "scripts": {
     "build": "NODE_OPTIONS=--openssl-legacy-provider NODE_ENV=production webpack --node-env production",
-    "docs": "documentation build index.js -f md > documentation.md"	
+    "docs": "documentation build index.js -f md > documentation.md"
   },
   "license": "MIT",
   "repository": {
