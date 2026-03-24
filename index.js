@@ -37,12 +37,12 @@ import TurboBase64 from "@pixagram/turbobase64";
 //   detectCircular  — only affects serialization behavior (throws vs infinite loop)
 //   memoryPoolSize  — only affects memory allocation
 const TURBO_SERIAL_DEFAULTS = {
-    compression: true,
-    preservePropertyDescriptors: true,
+    compression: false,
+    preservePropertyDescriptors: false,
     deduplication: false,
     simdOptimization: true,
     detectCircular: false,
-    shareArrayBuffers: true,
+    shareArrayBuffers: false,
     allowFunction: false,
     serializeFunctions: false,
     memoryPoolSize: 65536 * 4
