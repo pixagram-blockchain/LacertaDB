@@ -1,6 +1,6 @@
 {
   "name": "@pixagram/lacerta-db",
-  "version": "0.12.7",
+  "version": "0.13.0",
   "description": "Lacerta-DB is a Javascript IndexedDB Database for Web Browsers. Simple, Fast, Secure.",
   "devDependencies": {
     "@babel/core": "^7.23.6",
@@ -16,7 +16,7 @@
   },
   "dependencies": {
     "@pixagram/turbobase64": "~0.0.2",
-    "@pixagram/turboserial": "~0.3.2"
+    "@pixagram/turboserial": "~0.3.3"
   },
   "build": {},
   "author": "Affolter Matias",

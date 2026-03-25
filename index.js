@@ -1,7 +1,7 @@
 /**
- * LacertaDB V0.11.1 - Production Library
+ * LacertaDB V0.13.0 - Production Library
  * @module LacertaDB
- * @version 0.11.1
+ * @version 0.13.0
  * @license MIT
  * @author Pixagram SA
  */
@@ -55,41 +55,30 @@ const TURBO_SERIAL_DEFAULTS = {
 /**
  * Optimized QuickStore.
  * All documents live in an in-memory Map for O(1) reads (no serialization overhead).
- * localStorage is only touched on:
- *   - Lazy hydration (first access loads all docs from localStorage into memory)
- *   - Debounced writes (add/update/delete schedule an async persist)
- *   - beforeunload flush (synchronous save of dirty entries)
+ * IndexedDB is the persistence backend (non-blocking, no 5MB limit).
+ * Persistence triggers:
+ *   - Async hydration from IDB on startup (via hydrateFromIDB)
+ *   - Debounced writes (add/update/delete schedule an async persist to IDB)
  */
 class QuickStore {
-    constructor(dbName, serializer, base64) {
+    constructor(dbName, serializer, base64, idb = null) {
         this._dbName = dbName;
         this._serializer = serializer;
         this._base64 = base64;
-        this._keyPrefix = `lacertadb_${dbName}_quickstore_`;
-        this._indexKey = `${this._keyPrefix}index`;
+        this._idb = idb; // IDB connection for async persistence
+        this._metaKey = `quickstore_${dbName}`;
 
         // In-memory cache: docId → deserialized data
         this._docs = new Map();
         this._hydrated = false;
 
-        // Dirty tracking: set of docIds that need localStorage persistence
+        // Dirty tracking: set of docIds that need IDB persistence
         this._dirtyDocs = new Set();
         this._dirtyIndex = false;
         this._saveTimer = null;
-
-        // Safety: flush on unload
-        this._flushHandler = () => this._flushSync();
-        if (typeof window !== 'undefined') {
-            window.addEventListener('beforeunload', this._flushHandler);
-        }
     }
 
     destroy() {
-        this._flushSync();
-        if (typeof window !== 'undefined' && this._flushHandler) {
-            window.removeEventListener('beforeunload', this._flushHandler);
-            this._flushHandler = null;
-        }
         if (this._saveTimer) {
             if (typeof window !== 'undefined' && window.cancelIdleCallback) {
                 window.cancelIdleCallback(this._saveTimer);
@@ -100,32 +89,72 @@ class QuickStore {
         }
     }
 
-    /** Lazy hydration: load all docs from localStorage into memory on first access */
-    _ensureHydrated() {
+    /** Hydrate all quickstore docs from IDB on startup */
+    async hydrateFromIDB() {
         if (this._hydrated) return;
 
-        const indexStr = localStorage.getItem(this._indexKey);
+        if (this._idb && this._idb.objectStoreNames.contains('__meta')) {
+            try {
+                const stored = await Database._readMeta(this._idb, this._metaKey);
+                if (stored && stored.docs) {
+                    const decoded = this._base64.decode(stored.docs);
+                    const entries = this._serializer.deserialize(decoded);
+                    if (Array.isArray(entries)) {
+                        for (const [docId, data] of entries) {
+                            this._docs.set(docId, data);
+                        }
+                    }
+                }
+            } catch (e) {
+                console.warn('QuickStore IDB hydration failed, trying localStorage fallback.', e);
+                this._hydrateFromLocalStorage();
+            }
+        } else {
+            this._hydrateFromLocalStorage();
+        }
+        this._hydrated = true;
+    }
+
+    /** Legacy localStorage hydration (migration fallback) */
+    _hydrateFromLocalStorage() {
+        const keyPrefix = `lacertadb_${this._dbName}_quickstore_`;
+        const indexKey = `${keyPrefix}index`;
+        const indexStr = localStorage.getItem(indexKey);
         if (indexStr) {
             try {
                 const decoded = this._base64.decode(indexStr);
                 const list = this._serializer.deserialize(decoded);
                 for (const docId of list) {
-                    const key = `${this._keyPrefix}data_${docId}`;
+                    const key = `${keyPrefix}data_${docId}`;
                     const stored = localStorage.getItem(key);
                     if (stored) {
                         try {
                             const decodedDoc = this._base64.decode(stored);
                             this._docs.set(docId, this._serializer.deserialize(decodedDoc));
-                        } catch (e) {
-                            // Corrupted entry — skip it
-                        }
+                        } catch (e) { /* skip corrupted */ }
                     }
                 }
+                // Clean up localStorage after successful migration
+                this._dirtyIndex = true;
+                for (const docId of this._docs.keys()) this._dirtyDocs.add(docId);
+                this._persistDirty();
+                // Remove old localStorage keys
+                localStorage.removeItem(indexKey);
+                for (const docId of this._docs.keys()) {
+                    localStorage.removeItem(`${keyPrefix}data_${docId}`);
+                }
             } catch (e) {
-                console.warn('QuickStore index corrupted, resetting.', e);
+                console.warn('QuickStore localStorage hydration failed.', e);
             }
         }
-        this._hydrated = true;
+    }
+
+    _ensureHydrated() {
+        // In the new architecture, hydration is async via hydrateFromIDB()
+        // This is kept for backward compat with sync callers
+        if (!this._hydrated) {
+            this._hydrated = true; // prevent infinite recursion
+        }
     }
 
     /** Schedule debounced persistence of dirty entries */
@@ -144,44 +173,26 @@ class QuickStore {
         }
     }
 
-    /** Persist only dirty documents and the index if changed */
+    /** Persist all quickstore data to IDB as a single blob */
     _persistDirty() {
-        try {
-            for (const docId of this._dirtyDocs) {
-                const key = `${this._keyPrefix}data_${docId}`;
-                const data = this._docs.get(docId);
-                if (data !== undefined) {
-                    const serialized = this._serializer.serialize(data);
-                    const encoded = this._base64.encode(serialized);
-                    localStorage.setItem(key, encoded);
-                } else {
-                    localStorage.removeItem(key);
-                }
-            }
-            this._dirtyDocs.clear();
-
-            if (this._dirtyIndex) {
-                const list = Array.from(this._docs.keys());
-                const serialized = this._serializer.serialize(list);
-                const encoded = this._base64.encode(serialized);
-                localStorage.setItem(this._indexKey, encoded);
-                this._dirtyIndex = false;
-            }
-        } catch (e) {
-            if (e.name === 'QuotaExceededError') {
-                console.error('CRITICAL: QuickStore save failed — localStorage quota exceeded');
-                if (typeof window !== 'undefined') {
-                    window.dispatchEvent(new CustomEvent('lacertadb:quotaexceeded', { detail: { source: 'quickstore', db: this._dbName } }));
-                }
-            } else {
-                console.error('QuickStore save failed:', e);
-            }
-        }
-    }
-
-    _flushSync() {
         if (this._dirtyDocs.size === 0 && !this._dirtyIndex) return;
-        this._persistDirty();
+
+        this._dirtyDocs.clear();
+        this._dirtyIndex = false;
+
+        if (!this._idb || !this._idb.objectStoreNames.contains('__meta')) return;
+
+        try {
+            const entries = Array.from(this._docs.entries());
+            const serialized = this._serializer.serialize(entries);
+            const encoded = this._base64.encode(serialized);
+
+            Database._writeMeta(this._idb, this._metaKey, { docs: encoded }).catch(e => {
+                console.error('QuickStore IDB save failed:', e);
+            });
+        } catch (e) {
+            console.error('QuickStore serialization failed:', e);
+        }
     }
 
     add(docId, data) {
@@ -208,7 +219,7 @@ class QuickStore {
         this._ensureHydrated();
         if (this._docs.has(docId)) {
             this._docs.delete(docId);
-            this._dirtyDocs.add(docId); // marks for localStorage removal
+            this._dirtyDocs.add(docId);
             this._dirtyIndex = true;
             this._scheduleSave();
         }
@@ -231,10 +242,6 @@ class QuickStore {
 
     clear() {
         this._ensureHydrated();
-        for (const docId of this._docs.keys()) {
-            localStorage.removeItem(`${this._keyPrefix}data_${docId}`);
-        }
-        localStorage.removeItem(this._indexKey);
         this._docs.clear();
         this._dirtyDocs.clear();
         this._dirtyIndex = false;
@@ -246,6 +253,14 @@ class QuickStore {
             }
             this._saveTimer = null;
         }
+        // Clear from IDB
+        if (this._idb && this._idb.objectStoreNames.contains('__meta')) {
+            Database._writeMeta(this._idb, this._metaKey, { docs: null }).catch(() => {});
+        }
+        // Clean up any legacy localStorage keys
+        const keyPrefix = `lacertadb_${this._dbName}_quickstore_`;
+        const indexKey = `${keyPrefix}index`;
+        try { localStorage.removeItem(indexKey); } catch(e) {}
     }
 
     get size() {
@@ -330,6 +345,7 @@ const connectionPool = new IndexedDBConnectionPool();
 class AsyncMutex {
     constructor() {
         this._queue = [];
+        this._headIndex = 0;
         this._locked = false;
     }
 
@@ -355,12 +371,18 @@ class AsyncMutex {
     }
 
     _dispatch() {
-        if (this._locked || this._queue.length === 0) {
+        if (this._locked || this._headIndex >= this._queue.length) {
             return;
         }
         this._locked = true;
-        const resolve = this._queue.shift();
+        const resolve = this._queue[this._headIndex++];
         resolve(() => this.release());
+
+        // Compact when the consumed portion exceeds half the array
+        if (this._headIndex > 1000 && this._headIndex > (this._queue.length >>> 1)) {
+            this._queue = this._queue.slice(this._headIndex);
+            this._headIndex = 0;
+        }
     }
 }
 
@@ -537,12 +559,9 @@ class TTLCache {
         this._ttl = ttl;
         this._cache = new Map();       // key → { value, ts }
         this._sweepTimer = null;
-        this._sweepInterval = Math.min(ttl, 30000); // sweep at most every 30s
 
-        // Start periodic sweep
-        if (typeof globalThis !== 'undefined') {
-            this._sweepTimer = setInterval(() => this._sweep(), this._sweepInterval);
-        }
+        // Use requestIdleCallback for background sweeps (non-blocking)
+        this._scheduleSweep();
     }
 
     get(key) {
@@ -577,19 +596,41 @@ class TTLCache {
         return this._cache.size;
     }
 
-    /** Periodic sweep: remove all expired entries in one pass */
-    _sweep() {
-        const now = Date.now();
-        for (const [key, entry] of this._cache) {
-            if (now - entry.ts > this._ttl) {
-                this._cache.delete(key);
+    /** Chunked sweep via requestIdleCallback: process entries until idle deadline expires */
+    _scheduleSweep() {
+        if (typeof globalThis === 'undefined') return;
+
+        const sweepChunk = (deadline) => {
+            if (this._cache.size === 0) {
+                this._sweepTimer = requestIdleCallback(sweepChunk, { timeout: this._ttl });
+                return;
             }
-        }
+
+            const now = Date.now();
+            const iter = this._cache.entries();
+            let item = iter.next();
+
+            while (!item.done && deadline.timeRemaining() > 0) {
+                const [key, entry] = item.value;
+                if (now - entry.ts > this._ttl) {
+                    this._cache.delete(key);
+                }
+                item = iter.next();
+            }
+
+            this._sweepTimer = requestIdleCallback(sweepChunk, { timeout: this._ttl });
+        };
+
+        this._sweepTimer = requestIdleCallback(sweepChunk, { timeout: this._ttl });
     }
 
     destroy() {
         if (this._sweepTimer) {
-            clearInterval(this._sweepTimer);
+            if (typeof cancelIdleCallback !== 'undefined') {
+                cancelIdleCallback(this._sweepTimer);
+            } else {
+                clearTimeout(this._sweepTimer);
+            }
             this._sweepTimer = null;
         }
         this._cache.clear();
@@ -1910,7 +1951,21 @@ class TextIndex {
             if (results === null) {
                 results = new Set(docs);
             } else {
-                results = new Set([...results].filter(x => docs.has(x)));
+                // Direct Set intersection: always iterate the smaller set
+                if (results.size <= docs.size) {
+                    const intersection = new Set();
+                    for (const id of results) {
+                        if (docs.has(id)) intersection.add(id);
+                    }
+                    results = intersection;
+                } else {
+                    const intersection = new Set();
+                    for (const id of docs) {
+                        if (results.has(id)) intersection.add(id);
+                    }
+                    results = intersection;
+                }
+                if (results.size === 0) return [];
             }
         }
 
@@ -1976,7 +2031,17 @@ class GeoIndex {
         const candidates = this._tree.query(range);
         const results = [];
 
+        // Pre-filter: squared Euclidean distance in degrees (cheap rejection)
+        // 1 degree ≈ 111 km, so maxDistance/111 gives approx degree threshold
+        const threshDeg = rangeDeg;
+        const threshSq = threshDeg * threshDeg;
+
         for (const p of candidates) {
+            const dx = p.x - center.lng;
+            const dy = p.y - center.lat;
+            // Fast reject: if squared distance in degrees exceeds threshold, skip Haversine
+            if (dx * dx + dy * dy > threshSq) continue;
+
             const distance = this._haversine(center, {lat: p.y, lng: p.x});
             if (distance <= maxDistance) {
                 results.push({ docId: p.data, distance });
@@ -2442,38 +2507,31 @@ class IndexManager {
     }
 
     _getFieldValue(doc, path) {
-        const parts = path.split('.');
-        let value = doc;
-        for (const part of parts) {
-            if (value === null || value === undefined) {
-                return undefined;
-            }
-            value = value[part];
-        }
-        return value;
+        return queryEngine.getFieldValue(doc, path);
     }
 
     async _saveIndexMetadata() {
-        const key = `lacertadb_${this._collection.database.name}_${this._collection.name}_indexes`;
-        return new Promise((resolve) => {
-            const save = () => {
-                const metadata = {
-                    indexes: Array.from(this._indexes.entries()).map(([name, index]) => ({
-                        name,
-                        ...index
-                    }))
-                };
-                const serialized = this._serializer.serialize(metadata);
-                const encoded = this._base64.encode(serialized);
-                localStorage.setItem(key, encoded);
-                resolve();
-            };
-            if (typeof window !== 'undefined' && window.requestIdleCallback) {
-                window.requestIdleCallback(save);
-            } else {
-                setTimeout(save, 0);
-            }
-        });
+        const metaKey = `idxmeta_${this._collection.database.name}_${this._collection.name}`;
+
+        const metadata = {
+            indexes: Array.from(this._indexes.entries()).map(([name, index]) => ({
+                name,
+                ...index
+            }))
+        };
+        const serialized = this._serializer.serialize(metadata);
+        const encoded = this._base64.encode(serialized);
+
+        const idb = this._collection._db;
+        if (idb && idb.objectStoreNames.contains('__meta')) {
+            Database._writeMeta(idb, metaKey, { data: encoded }).catch(e => {
+                console.warn('IndexManager metadata IDB save failed:', e);
+            });
+        } else {
+            // Fallback: localStorage
+            const key = `lacertadb_${this._collection.database.name}_${this._collection.name}_indexes`;
+            localStorage.setItem(key, encoded);
+        }
     }
 
     /**
@@ -2482,13 +2540,35 @@ class IndexManager {
      * SLOW PATH: Full rebuild only if persisted data is missing/corrupt.
      */
     async loadIndexMetadata() {
-        const key = `lacertadb_${this._collection.database.name}_${this._collection.name}_indexes`;
-        const stored = localStorage.getItem(key);
+        const metaKey = `idxmeta_${this._collection.database.name}_${this._collection.name}`;
+        let encoded = null;
 
-        if (!stored) return;
+        // Try IDB first
+        const idb = this._collection._db;
+        if (idb && idb.objectStoreNames.contains('__meta')) {
+            try {
+                const stored = await Database._readMeta(idb, metaKey);
+                if (stored && stored.data) {
+                    encoded = stored.data;
+                }
+            } catch (e) { /* fallback to localStorage */ }
+        }
+
+        // Fallback: localStorage (for migration)
+        if (!encoded) {
+            const lsKey = `lacertadb_${this._collection.database.name}_${this._collection.name}_indexes`;
+            const lsStored = localStorage.getItem(lsKey);
+            if (lsStored) {
+                encoded = lsStored;
+                // Migrate to IDB on next save
+                localStorage.removeItem(lsKey);
+            }
+        }
+
+        if (!encoded) return;
 
         try {
-            const decoded = this._base64.decode(stored);
+            const decoded = this._base64.decode(encoded);
             const metadata = this._serializer.deserialize(decoded);
 
             if (!metadata || !Array.isArray(metadata.indexes)) return;
@@ -2812,34 +2892,122 @@ class IndexedDBUtility {
     }
 
     async batchOperation(db, operations, storeName = 'documents') {
-        return this.performTransaction(db, [storeName], 'readwrite', tx => {
-            const store = tx.objectStore(storeName);
+        return new Promise((resolve, reject) => {
+            const results = new Array(operations.length);
+            let hasError = false;
 
-            // CRITICAL: Queue ALL IDB requests synchronously to prevent
-            // TransactionInactiveError. Do NOT use await between requests.
-            const promises = operations.map(op => {
+            const transaction = db.transaction([storeName], 'readwrite');
+            const store = transaction.objectStore(storeName);
+
+            transaction.oncomplete = () => resolve(results);
+            transaction.onerror = () => {
+                // Fill remaining results with error
+                for (let i = 0; i < results.length; i++) {
+                    if (!results[i]) results[i] = { success: false, error: transaction.error?.message || 'Transaction failed' };
+                }
+                reject(new LacertaDBError('Batch transaction failed', 'TRANSACTION_FAILED', transaction.error));
+            };
+            transaction.onabort = () => {
+                for (let i = 0; i < results.length; i++) {
+                    if (!results[i]) results[i] = { success: false, error: 'Transaction aborted' };
+                }
+                reject(new LacertaDBError('Batch transaction aborted', 'TRANSACTION_ABORTED'));
+            };
+
+            // Fire all IDB requests synchronously in a tight loop — no Promises per request
+            for (let i = 0; i < operations.length; i++) {
+                const op = operations[i];
+                let request;
                 try {
                     switch (op.type) {
                         case 'add':
-                            return this._promisifyRequest(() => store.add(op.data))
-                                .then(result => ({ success: true, result }));
+                            request = store.add(op.data);
+                            break;
                         case 'put':
-                            return this._promisifyRequest(() => store.put(op.data))
-                                .then(result => ({ success: true, result }));
+                            request = store.put(op.data);
+                            break;
                         case 'delete':
-                            return this._promisifyRequest(() => store.delete(op.key))
-                                .then(result => ({ success: true, result }));
+                            request = store.delete(op.key);
+                            break;
                         default:
-                            return Promise.resolve({ success: false, error: `Unknown operation type: ${op.type}` });
+                            results[i] = { success: false, error: `Unknown operation type: ${op.type}` };
+                            continue;
                     }
-                } catch (error) {
-                    return Promise.resolve({ success: false, error: error.message });
-                }
-            });
 
-            return Promise.all(promises);
+                    // Capture index in closure for async callbacks
+                    const idx = i;
+                    request.onsuccess = () => {
+                        results[idx] = { success: true, result: request.result };
+                    };
+                    request.onerror = (e) => {
+                        results[idx] = { success: false, error: request.error?.message || 'Request failed' };
+                        // Prevent the error from aborting the entire transaction
+                        e.preventDefault();
+                        e.stopPropagation();
+                    };
+                } catch (error) {
+                    results[i] = { success: false, error: error.message };
+                }
+            }
         });
     }
+}
+
+// ========================
+// ULID Generator (Lexicographically Sortable IDs)
+// ========================
+
+const _ULID_ENCODING = '0123456789ABCDEFGHJKMNPQRSTVWXYZ'; // Crockford's Base32
+let _ulid_lastTime = 0;
+let _ulid_lastRandom = new Uint8Array(10);
+
+function _generateULID() {
+    let now = Date.now();
+
+    // Timestamp component: 10 chars of Crockford Base32 (48 bits = ~8900 years from epoch)
+    let ts = '';
+    let t = now;
+    for (let i = 9; i >= 0; i--) {
+        ts = _ULID_ENCODING[t & 31] + ts;
+        t = Math.floor(t / 32);
+    }
+
+    // Randomness component: 16 chars (80 bits)
+    // If same millisecond, increment the random component for monotonicity
+    if (now === _ulid_lastTime) {
+        // Increment the random bytes (big-endian)
+        let carry = 1;
+        for (let i = 9; i >= 0 && carry; i--) {
+            const sum = _ulid_lastRandom[i] + carry;
+            _ulid_lastRandom[i] = sum & 0xFF;
+            carry = sum >>> 8;
+        }
+    } else {
+        crypto.getRandomValues(_ulid_lastRandom);
+        _ulid_lastTime = now;
+    }
+
+    let rand = '';
+    // Encode 10 random bytes as 16 Base32 chars
+    const r = _ulid_lastRandom;
+    rand += _ULID_ENCODING[(r[0] & 248) >>> 3];
+    rand += _ULID_ENCODING[((r[0] & 7) << 2) | ((r[1] & 192) >>> 6)];
+    rand += _ULID_ENCODING[(r[1] & 62) >>> 1];
+    rand += _ULID_ENCODING[((r[1] & 1) << 4) | ((r[2] & 240) >>> 4)];
+    rand += _ULID_ENCODING[((r[2] & 15) << 1) | ((r[3] & 128) >>> 7)];
+    rand += _ULID_ENCODING[(r[3] & 124) >>> 2];
+    rand += _ULID_ENCODING[((r[3] & 3) << 3) | ((r[4] & 224) >>> 5)];
+    rand += _ULID_ENCODING[r[4] & 31];
+    rand += _ULID_ENCODING[(r[5] & 248) >>> 3];
+    rand += _ULID_ENCODING[((r[5] & 7) << 2) | ((r[6] & 192) >>> 6)];
+    rand += _ULID_ENCODING[(r[6] & 62) >>> 1];
+    rand += _ULID_ENCODING[((r[6] & 1) << 4) | ((r[7] & 240) >>> 4)];
+    rand += _ULID_ENCODING[((r[7] & 15) << 1) | ((r[8] & 128) >>> 7)];
+    rand += _ULID_ENCODING[(r[8] & 124) >>> 2];
+    rand += _ULID_ENCODING[((r[8] & 3) << 3) | ((r[9] & 224) >>> 5)];
+    rand += _ULID_ENCODING[r[9] & 31];
+
+    return ts + rand;
 }
 
 // ========================
@@ -2874,7 +3042,7 @@ class Document {
     }
 
     _generateId() {
-        return `doc_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
+        return _generateULID();
     }
 
     async pack(encryptionUtil = null) {
@@ -2976,12 +3144,13 @@ class Document {
 // ========================
 
 class CollectionMetadata {
-    constructor(name, data = {}, serializer, base64, dbName) {
+    constructor(name, data = {}, serializer, base64, dbName, idb = null) {
         this.name = name;
         this._serializer = serializer;
         this._base64 = base64;
         this._dbName = dbName;
-        this._storageKey = dbName ? `lacertadb_${dbName}_${name}_collmeta` : null;
+        this._idb = idb; // IDB connection for async persistence
+        this._metaKey = dbName ? `collmeta_${dbName}_${name}` : null;
 
         // Aggregate stats
         this.sizeKB = data.sizeKB || 0;
@@ -2998,12 +3167,11 @@ class CollectionMetadata {
         // Debounced persistence
         this._dirty = false;
         this._saveTimer = null;
+    }
 
-        // Safety: flush on page unload
-        this._flushHandler = () => this._flushSync();
-        if (typeof window !== 'undefined') {
-            window.addEventListener('beforeunload', this._flushHandler);
-        }
+    /** Set the IDB connection for persistence (called after Database.init()) */
+    setIDB(idb) {
+        this._idb = idb;
     }
 
     // ---- Mutations (in-memory only, schedule async save) ----
@@ -3104,40 +3272,54 @@ class CollectionMetadata {
 
     _flushSync() {
         if (!this._dirty) return;
+        // Can't do sync IDB writes — trigger async persist and hope it completes
         this._persistToStorage();
     }
 
     _persistToStorage() {
-        if (!this._storageKey || !this._serializer || !this._base64) return;
+        if (!this._metaKey || !this._serializer || !this._base64) return;
+
+        const dataToStore = {
+            sizeKB: this.sizeKB,
+            length: this.length,
+            createdAt: this.createdAt,
+            modifiedAt: this.modifiedAt,
+            _docSizes: Array.from(this._docSizes.entries()),
+            _docModified: Array.from(this._docModified.entries()),
+            _docPermanent: Array.from(this._docPermanent.entries()),
+            _docAttachments: Array.from(this._docAttachments.entries())
+        };
+
         try {
-            const dataToStore = {
-                sizeKB: this.sizeKB,
-                length: this.length,
-                createdAt: this.createdAt,
-                modifiedAt: this.modifiedAt,
-                _docSizes: Array.from(this._docSizes.entries()),
-                _docModified: Array.from(this._docModified.entries()),
-                _docPermanent: Array.from(this._docPermanent.entries()),
-                _docAttachments: Array.from(this._docAttachments.entries())
-            };
             const serialized = this._serializer.serialize(dataToStore);
             const encoded = this._base64.encode(serialized);
-            localStorage.setItem(this._storageKey, encoded);
-            this._dirty = false;
+
+            if (this._idb && this._idb.objectStoreNames.contains('__meta')) {
+                // Primary: async IDB write (non-blocking)
+                Database._writeMeta(this._idb, this._metaKey, { data: encoded }).catch(e => {
+                    console.warn('CollectionMetadata IDB save failed:', e);
+                });
+                this._dirty = false;
+            } else {
+                // Fallback: localStorage (only if IDB not available)
+                const lsKey = `lacertadb_${this._dbName}_${this.name}_collmeta`;
+                localStorage.setItem(lsKey, encoded);
+                this._dirty = false;
+            }
         } catch (e) {
             if (e.name === 'QuotaExceededError') {
-                // Fallback: persist only aggregate stats (drop per-doc maps)
+                // Fallback: persist only aggregate stats
                 console.warn('CollectionMetadata: quota exceeded, saving aggregates only');
                 try {
                     const fallback = {
-                        sizeKB: this.sizeKB,
-                        length: this.length,
-                        createdAt: this.createdAt,
-                        modifiedAt: this.modifiedAt
+                        sizeKB: this.sizeKB, length: this.length,
+                        createdAt: this.createdAt, modifiedAt: this.modifiedAt
                     };
                     const serialized = this._serializer.serialize(fallback);
                     const encoded = this._base64.encode(serialized);
-                    localStorage.setItem(this._storageKey, encoded);
+                    if (this._idb && this._idb.objectStoreNames.contains('__meta')) {
+                        Database._writeMeta(this._idb, this._metaKey, { data: encoded }).catch(() => {});
+                    }
                     this._dirty = false;
                 } catch (e2) {
                     console.error('CollectionMetadata: fallback save also failed:', e2);
@@ -3148,7 +3330,47 @@ class CollectionMetadata {
         }
     }
 
+    /** Load from IDB with localStorage migration fallback */
+    static async loadAsync(dbName, collName, serializer, base64, idb) {
+        const metaKey = `collmeta_${dbName}_${collName}`;
+
+        // Try IDB first
+        if (idb && idb.objectStoreNames.contains('__meta')) {
+            try {
+                const stored = await Database._readMeta(idb, metaKey);
+                if (stored && stored.data) {
+                    const decoded = base64.decode(stored.data);
+                    const data = serializer.deserialize(decoded);
+                    return new CollectionMetadata(collName, data, serializer, base64, dbName, idb);
+                }
+            } catch (e) {
+                console.warn('CollectionMetadata IDB load failed, trying localStorage:', e);
+            }
+        }
+
+        // Fallback: localStorage (for migration)
+        const lsKey = `lacertadb_${dbName}_${collName}_collmeta`;
+        const lsStored = localStorage.getItem(lsKey);
+        if (lsStored) {
+            try {
+                const decoded = base64.decode(lsStored);
+                const data = serializer.deserialize(decoded);
+                const meta = new CollectionMetadata(collName, data, serializer, base64, dbName, idb);
+                // Migrate to IDB and remove localStorage key
+                meta._dirty = true;
+                meta._persistToStorage();
+                localStorage.removeItem(lsKey);
+                return meta;
+            } catch (e) {
+                console.warn('CollectionMetadata localStorage corrupted, resetting:', e);
+            }
+        }
+
+        return new CollectionMetadata(collName, {}, serializer, base64, dbName, idb);
+    }
+
     static load(dbName, collName, serializer, base64) {
+        // Synchronous fallback for backward compat
         const key = `lacertadb_${dbName}_${collName}_collmeta`;
         const stored = localStorage.getItem(key);
         if (stored) {
@@ -3167,10 +3389,6 @@ class CollectionMetadata {
 
     destroy() {
         this._flushSync();
-        if (typeof window !== 'undefined' && this._flushHandler) {
-            window.removeEventListener('beforeunload', this._flushHandler);
-            this._flushHandler = null;
-        }
         if (this._saveTimer) {
             if (typeof window !== 'undefined' && window.cancelIdleCallback) {
                 window.cancelIdleCallback(this._saveTimer);
@@ -3195,10 +3413,12 @@ class CollectionMetadata {
 }
 
 class DatabaseMetadata {
-    constructor(name, data = {}, serializer, base64) {
+    constructor(name, data = {}, serializer, base64, idb = null) {
         this.name = name;
         this._serializer = serializer;
         this._base64 = base64;
+        this._idb = idb;
+        this._metaKey = `dbmeta_${name}`;
         if (!data || typeof data !== 'object') data = {};
         this.collections = data.collections || {};
         this.totalSizeKB = data.totalSizeKB || 0;
@@ -3208,14 +3428,58 @@ class DatabaseMetadata {
         // Debounced persistence
         this._dirty = false;
         this._saveTimer = null;
+    }
 
-        this._flushHandler = () => this._flushSync();
-        if (typeof window !== 'undefined') {
-            window.addEventListener('beforeunload', this._flushHandler);
+    /** Set the IDB connection for persistence */
+    setIDB(idb) {
+        this._idb = idb;
+    }
+
+    /** Async load: IDB first, localStorage migration fallback */
+    static async loadAsync(dbName, serializer, base64, idb) {
+        const metaKey = `dbmeta_${dbName}`;
+
+        // Try IDB first
+        if (idb && idb.objectStoreNames.contains('__meta')) {
+            try {
+                const stored = await Database._readMeta(idb, metaKey);
+                if (stored && stored.data) {
+                    const decoded = base64.decode(stored.data);
+                    const data = serializer.deserialize(decoded);
+                    if (data && typeof data === 'object') {
+                        return new DatabaseMetadata(dbName, data, serializer, base64, idb);
+                    }
+                }
+            } catch (e) {
+                console.warn('DatabaseMetadata IDB load failed, trying localStorage:', e);
+            }
         }
+
+        // Fallback: localStorage (for migration)
+        const lsKey = `lacertadb_${dbName}_metadata`;
+        const lsStored = localStorage.getItem(lsKey);
+        if (lsStored) {
+            try {
+                const decoded = base64.decode(lsStored);
+                const data = serializer.deserialize(decoded);
+                if (data && typeof data === 'object') {
+                    const meta = new DatabaseMetadata(dbName, data, serializer, base64, idb);
+                    // Migrate to IDB
+                    meta._dirty = true;
+                    meta._persistToStorage();
+                    localStorage.removeItem(lsKey);
+                    return meta;
+                }
+            } catch (e) {
+                console.error('Failed to load metadata from localStorage:', e);
+            }
+        }
+
+        return new DatabaseMetadata(dbName, {}, serializer, base64, idb);
     }
 
     static load(dbName, serializer, base64) {
+        // Synchronous fallback for backward compat
         const key = `lacertadb_${dbName}_metadata`;
         const stored = localStorage.getItem(key);
         if (stored) {
@@ -3225,7 +3489,6 @@ class DatabaseMetadata {
                 if (data && typeof data === 'object') {
                     return new DatabaseMetadata(dbName, data, serializer, base64);
                 }
-                // Corrupted/stale — fall through to fresh metadata
             } catch (e) {
                 console.error('Failed to load metadata:', e);
             }
@@ -3281,7 +3544,6 @@ class DatabaseMetadata {
     }
 
     _persistToStorage() {
-        const key = `lacertadb_${this.name}_metadata`;
         try {
             const dataToStore = {
                 collections: this.collections,
@@ -3291,11 +3553,22 @@ class DatabaseMetadata {
             };
             const serializedData = this._serializer.serialize(dataToStore);
             const encodedData = this._base64.encode(serializedData);
-            localStorage.setItem(key, encodedData);
-            this._dirty = false;
+
+            if (this._idb && this._idb.objectStoreNames.contains('__meta')) {
+                // Primary: async IDB write (non-blocking)
+                Database._writeMeta(this._idb, this._metaKey, { data: encodedData }).catch(e => {
+                    console.warn('DatabaseMetadata IDB save failed:', e);
+                });
+                this._dirty = false;
+            } else {
+                // Fallback: localStorage
+                const key = `lacertadb_${this.name}_metadata`;
+                localStorage.setItem(key, encodedData);
+                this._dirty = false;
+            }
         } catch (e) {
             if (e.name === 'QuotaExceededError') {
-                console.error('CRITICAL: LocalStorage quota exceeded. Metadata not saved for db:', this.name);
+                console.error('CRITICAL: Metadata save failed — quota exceeded for db:', this.name);
                 if (typeof window !== 'undefined') {
                     window.dispatchEvent(new CustomEvent('lacertadb:quotaexceeded', { detail: { db: this.name } }));
                 }
@@ -3315,10 +3588,6 @@ class DatabaseMetadata {
 
     destroy() {
         this._flushSync();
-        if (typeof window !== 'undefined' && this._flushHandler) {
-            window.removeEventListener('beforeunload', this._flushHandler);
-            this._flushHandler = null;
-        }
         if (this._saveTimer) {
             if (typeof window !== 'undefined' && window.cancelIdleCallback) {
                 window.cancelIdleCallback(this._saveTimer);
@@ -3331,17 +3600,63 @@ class DatabaseMetadata {
 }
 
 class Settings {
-    constructor(dbName, data = {}, serializer, base64) {
+    constructor(dbName, data = {}, serializer, base64, idb = null) {
         this.dbName = dbName;
         this._serializer = serializer;
         this._base64 = base64;
+        this._idb = idb;
+        this._metaKey = `settings_${dbName}`;
         this.sizeLimitKB = data.sizeLimitKB != null ? data.sizeLimitKB : Infinity;
         const defaultBuffer = this.sizeLimitKB === Infinity ? Infinity : this.sizeLimitKB * 0.8;
         this.bufferLimitKB = data.bufferLimitKB != null ? data.bufferLimitKB : defaultBuffer;
         this.freeSpaceEvery = this.sizeLimitKB === Infinity ? 0 : (data.freeSpaceEvery || 10000);
     }
 
+    /** Set the IDB connection for persistence */
+    setIDB(idb) {
+        this._idb = idb;
+    }
+
+    /** Async load: IDB first, localStorage migration fallback */
+    static async loadAsync(dbName, serializer, base64, idb) {
+        const metaKey = `settings_${dbName}`;
+
+        // Try IDB first
+        if (idb && idb.objectStoreNames.contains('__meta')) {
+            try {
+                const stored = await Database._readMeta(idb, metaKey);
+                if (stored && stored.data) {
+                    const decoded = base64.decode(stored.data);
+                    const data = serializer.deserialize(decoded);
+                    return new Settings(dbName, data, serializer, base64, idb);
+                }
+            } catch (e) {
+                console.warn('Settings IDB load failed, trying localStorage:', e);
+            }
+        }
+
+        // Fallback: localStorage (for migration)
+        const lsKey = `lacertadb_${dbName}_settings`;
+        const lsStored = localStorage.getItem(lsKey);
+        if (lsStored) {
+            try {
+                const decoded = base64.decode(lsStored);
+                const data = serializer.deserialize(decoded);
+                const settings = new Settings(dbName, data, serializer, base64, idb);
+                // Migrate to IDB
+                settings.save();
+                localStorage.removeItem(lsKey);
+                return settings;
+            } catch (e) {
+                console.error('Failed to load settings from localStorage:', e);
+            }
+        }
+
+        return new Settings(dbName, {}, serializer, base64, idb);
+    }
+
     static load(dbName, serializer, base64) {
+        // Synchronous fallback for backward compat
         const key = `lacertadb_${dbName}_settings`;
         const stored = localStorage.getItem(key);
         if (stored) {
@@ -3357,7 +3672,6 @@ class Settings {
     }
 
     save() {
-        const key = `lacertadb_${this.dbName}_settings`;
         try {
             const dataToStore = {
                 sizeLimitKB: this.sizeLimitKB,
@@ -3366,10 +3680,18 @@ class Settings {
             };
             const serializedData = this._serializer.serialize(dataToStore);
             const encodedData = this._base64.encode(serializedData);
-            localStorage.setItem(key, encodedData);
+
+            if (this._idb && this._idb.objectStoreNames.contains('__meta')) {
+                Database._writeMeta(this._idb, this._metaKey, { data: encodedData }).catch(e => {
+                    console.warn('Settings IDB save failed:', e);
+                });
+            } else {
+                const key = `lacertadb_${this.dbName}_settings`;
+                localStorage.setItem(key, encodedData);
+            }
         } catch (e) {
             if (e.name === 'QuotaExceededError') {
-                console.error('CRITICAL: Settings save failed — localStorage quota exceeded');
+                console.error('CRITICAL: Settings save failed — quota exceeded');
                 if (typeof window !== 'undefined') {
                     window.dispatchEvent(new CustomEvent('lacertadb:quotaexceeded', { detail: { source: 'settings', db: this.dbName } }));
                 }
@@ -3397,6 +3719,9 @@ class Settings {
 
 class QueryEngine {
     constructor() {
+        // Path cache: avoids repeated path.split('.') allocations during scans
+        this._pathCache = new Map();
+
         this.operators = {
             '$eq': (a, b) => a === b,
             '$ne': (a, b) => a !== b,
@@ -3457,13 +3782,39 @@ class QueryEngine {
         return true;
     }
 
+    /** Pre-parse and cache a dot-path into an array of segments */
+    _getParsedPath(path) {
+        let parts = this._pathCache.get(path);
+        if (parts === undefined) {
+            parts = path.indexOf('.') === -1 ? null : path.split('.');
+            this._pathCache.set(path, parts);
+            // Cap cache size to prevent unbounded growth
+            if (this._pathCache.size > 2000) {
+                // Delete oldest entries (first 500)
+                const iter = this._pathCache.keys();
+                for (let i = 0; i < 500; i++) iter.next();
+                // Rebuild with remaining
+                const newCache = new Map();
+                for (const [k, v] of this._pathCache) newCache.set(k, v);
+                this._pathCache = newCache;
+            }
+        }
+        return parts;
+    }
+
     getFieldValue(doc, path) {
+        // Fast path: no dot in path (single-level field access)
+        const parts = this._getParsedPath(path);
+        if (parts === null) {
+            return doc == null ? undefined : doc[path];
+        }
+
         let current = doc;
-        for (const part of path.split('.')) {
+        for (let i = 0; i < parts.length; i++) {
             if (current === null || current === undefined) {
                 return undefined;
             }
-            current = current[part];
+            current = current[parts[i]];
         }
         return current;
     }
@@ -3517,12 +3868,16 @@ class AggregationPipeline {
                 const groups = new Map();
                 const idField = groupSpec._id;
 
-                // Helper: recursively sort object keys for stable JSON serialization
-                const stableStringify = (obj) => {
-                    if (obj === null || typeof obj !== 'object') return JSON.stringify(obj);
-                    if (Array.isArray(obj)) return '[' + obj.map(stableStringify).join(',') + ']';
-                    const sorted = Object.keys(obj).sort();
-                    return '{' + sorted.map(k => JSON.stringify(k) + ':' + stableStringify(obj[k])).join(',') + '}';
+                // Fast key generation: avoid recursive stableStringify for primitives/flat arrays
+                const fastKey = (val) => {
+                    if (val === null || val === undefined) return '\x00null';
+                    const t = typeof val;
+                    if (t === 'string') return '\x01' + val;
+                    if (t === 'number' || t === 'boolean') return '\x02' + val;
+                    if (Array.isArray(val)) return '\x03[' + val.join(',') + ']';
+                    // Object key: sorted JSON (last resort)
+                    const sorted = Object.keys(val).sort();
+                    return '\x04{' + sorted.map(k => k + ':' + fastKey(val[k])).join(',') + '}';
                 };
 
                 // Helper: resolve $field references in an _id expression object
@@ -3547,7 +3902,7 @@ class AggregationPipeline {
                             ? queryEngine.getFieldValue(doc, idField.substring(1))
                             : idField;
                     } else if (idField !== null && typeof idField === 'object') {
-                        groupKey = stableStringify(resolveIdValue(doc, idField));
+                        groupKey = fastKey(resolveIdValue(doc, idField));
                     } else {
                         groupKey = idField; // null or literal
                     }
@@ -3593,14 +3948,53 @@ class AggregationPipeline {
             },
 
             '$lookup': async (docs, lookupSpec, db) => {
+                // Collect unique localField values to avoid loading the entire foreign collection
+                const localValues = new Set();
+                for (const doc of docs) {
+                    const val = queryEngine.getFieldValue(doc, lookupSpec.localField);
+                    if (val !== undefined && val !== null) localValues.add(val);
+                }
+
                 const foreignCollection = await db.getCollection(lookupSpec.from);
-                const foreignDocs = await foreignCollection.getAll();
                 const foreignMap = new Map();
-                foreignDocs.forEach(doc => {
-                    const key = queryEngine.getFieldValue(doc, lookupSpec.foreignField);
-                    if (!foreignMap.has(key)) foreignMap.set(key, []);
-                    foreignMap.get(key).push(doc);
-                });
+
+                if (localValues.size > 0) {
+                    // Try to use an index on the foreign field for selective fetch
+                    const foreignIndexes = foreignCollection._indexManager.indexes;
+                    let usedIndex = false;
+
+                    for (const [indexName, index] of foreignIndexes) {
+                        if (index.fieldPath === lookupSpec.foreignField) {
+                            // Use $in query via the index
+                            const docIds = await foreignCollection._indexManager.query(
+                                indexName, { $in: Array.from(localValues) }
+                            );
+                            const fetchedDocs = await Promise.all(
+                                docIds.map(id => foreignCollection.get(id).catch(() => null))
+                            );
+                            for (const doc of fetchedDocs) {
+                                if (!doc) continue;
+                                const key = queryEngine.getFieldValue(doc, lookupSpec.foreignField);
+                                if (!foreignMap.has(key)) foreignMap.set(key, []);
+                                foreignMap.get(key).push(doc);
+                            }
+                            usedIndex = true;
+                            break;
+                        }
+                    }
+
+                    if (!usedIndex) {
+                        // Fallback: query with filter (still avoids loading ALL docs into memory)
+                        const foreignDocs = await foreignCollection.query({
+                            [lookupSpec.foreignField]: { $in: Array.from(localValues) }
+                        });
+                        for (const doc of foreignDocs) {
+                            const key = queryEngine.getFieldValue(doc, lookupSpec.foreignField);
+                            if (!foreignMap.has(key)) foreignMap.set(key, []);
+                            foreignMap.get(key).push(doc);
+                        }
+                    }
+                }
 
                 return docs.map(doc => {
                     const localValue = queryEngine.getFieldValue(doc, lookupSpec.localField);
@@ -3811,12 +4205,61 @@ class PerformanceMonitor {
 // ========================
 
 /**
+ * MurmurHash3 (32-bit) for fast, deterministic cache key generation.
+ * Produces a numeric hash from a string — avoids JSON.stringify + sort overhead.
+ * @param {string} str
+ * @param {number} [seed=0]
+ * @returns {number}
+ */
+function _murmurHash3(str, seed = 0) {
+    let h = seed | 0;
+    const len = str.length;
+    const nblocks = len >>> 2;
+
+    for (let i = 0; i < nblocks; i++) {
+        const i4 = i << 2;
+        let k = (str.charCodeAt(i4) & 0xffff) |
+            ((str.charCodeAt(i4 + 1) & 0xffff) << 8) |
+            ((str.charCodeAt(i4 + 2) & 0xffff) << 16) |
+            ((str.charCodeAt(i4 + 3) & 0xffff) << 24);
+
+        k = Math.imul(k, 0xcc9e2d51);
+        k = (k << 15) | (k >>> 17);
+        k = Math.imul(k, 0x1b873593);
+
+        h ^= k;
+        h = (h << 13) | (h >>> 19);
+        h = Math.imul(h, 5) + 0xe6546b64 | 0;
+    }
+
+    let k = 0;
+    const tail = nblocks << 2;
+    switch (len & 3) {
+        case 3: k ^= (str.charCodeAt(tail + 2) & 0xffff) << 16;
+        case 2: k ^= (str.charCodeAt(tail + 1) & 0xffff) << 8;
+        case 1:
+            k ^= str.charCodeAt(tail) & 0xffff;
+            k = Math.imul(k, 0xcc9e2d51);
+            k = (k << 15) | (k >>> 17);
+            k = Math.imul(k, 0x1b873593);
+            h ^= k;
+    }
+
+    h ^= len;
+    h ^= h >>> 16;
+    h = Math.imul(h, 0x85ebca6b);
+    h ^= h >>> 13;
+    h = Math.imul(h, 0xc2b2ae35);
+    h ^= h >>> 16;
+    return h >>> 0;
+}
+
+/**
  * Generate a deterministic cache key from query filter + options.
- * Uses sorted-keys JSON.stringify for stability, avoiding the overhead
- * of full TurboSerial serialize + Base64 encode on every query call.
+ * Uses sorted-keys JSON serialization hashed via MurmurHash3 for speed.
  * @param {object} filter
  * @param {object} options
- * @returns {string}
+ * @returns {number}
  */
 function _stableCacheKey(filter, options) {
     const replacer = (_, v) => {
@@ -3827,7 +4270,8 @@ function _stableCacheKey(filter, options) {
         }
         return v;
     };
-    return JSON.stringify({ f: filter, o: options }, replacer);
+    const str = JSON.stringify({ f: filter, o: options }, replacer);
+    return _murmurHash3(str);
 }
 
 // ========================
@@ -3883,13 +4327,12 @@ class Collection {
         if (this._initialized) return this;
 
         // Use the parent Database's consolidated IDB connection
-        // (ensure store exists in case ensureCollection was used without createCollection)
         await this.database._ensureStore(this._storeName);
         this._db = this.database._db;
 
-        // Load per-collection metadata (with per-doc tracking) from its own localStorage key
-        this._metadata = CollectionMetadata.load(
-            this.database.name, this.name, this._serializer, this._base64
+        // Load per-collection metadata from IDB (with localStorage migration fallback)
+        this._metadata = await CollectionMetadata.loadAsync(
+            this.database.name, this.name, this._serializer, this._base64, this._db
         );
 
         await this._indexManager.loadIndexMetadata();
@@ -4469,7 +4912,7 @@ class Collection {
             // Reset metadata
             if (this._metadata) this._metadata.destroy();
             this._metadata = new CollectionMetadata(
-                this.name, {}, this._serializer, this._base64, this.database.name
+                this.name, {}, this._serializer, this._base64, this.database.name, this._db
             );
             this._metadata._flushSync();
             this.database.metadata.setCollection(this._metadata);
@@ -4626,6 +5069,10 @@ class Database {
             request.onsuccess = () => resolve(request.result);
             request.onupgradeneeded = event => {
                 const db = event.target.result;
+                // Always ensure __meta store exists for metadata persistence
+                if (!db.objectStoreNames.contains('__meta')) {
+                    db.createObjectStore('__meta', { keyPath: '_id' });
+                }
                 for (const storeName of knownStores) {
                     if (!db.objectStoreNames.contains(storeName)) {
                         const store = db.createObjectStore(storeName, { keyPath: '_id' });
@@ -4701,12 +5148,19 @@ class Database {
     }
 
     async init(options = {}) {
-        this._metadata = DatabaseMetadata.load(this.name, this._serializer, this._base64);
-        this._settings = Settings.load(this.name, this._serializer, this._base64);
-        this._quickStore = new QuickStore(this.name, this._serializer, this._base64);
-
-        // Open the consolidated IDB connection
+        // Open the consolidated IDB connection first (needed for metadata IDB persistence)
         await this._getConnection();
+
+        // Ensure __meta store exists
+        if (!this._db.objectStoreNames.contains('__meta')) {
+            await this._ensureStore('__meta');
+        }
+
+        // Load metadata from IDB (with localStorage migration/fallback)
+        this._metadata = await DatabaseMetadata.loadAsync(this.name, this._serializer, this._base64, this._db);
+        this._settings = await Settings.loadAsync(this.name, this._serializer, this._base64, this._db);
+        this._quickStore = new QuickStore(this.name, this._serializer, this._base64, this._db);
+        await this._quickStore.hydrateFromIDB();
 
         // Migrate old per-collection databases if they exist
         await this._migrateOldDatabases();
@@ -4716,6 +5170,51 @@ class Database {
         }
 
         return this;
+    }
+
+    /**
+     * Read a metadata entry from the __meta IDB store.
+     * @param {IDBDatabase} db
+     * @param {string} key
+     * @returns {Promise<*>}
+     */
+    static async _readMeta(db, key) {
+        if (!db || !db.objectStoreNames.contains('__meta')) return null;
+        return new Promise((resolve) => {
+            try {
+                const tx = db.transaction('__meta', 'readonly');
+                const store = tx.objectStore('__meta');
+                const request = store.get(key);
+                request.onsuccess = () => resolve(request.result || null);
+                request.onerror = () => resolve(null);
+            } catch (e) {
+                resolve(null);
+            }
+        });
+    }
+
+    /**
+     * Write a metadata entry to the __meta IDB store.
+     * @param {IDBDatabase} db
+     * @param {string} key
+     * @param {*} data - Must include _id property matching key
+     * @returns {Promise<void>}
+     */
+    static async _writeMeta(db, key, data) {
+        if (!db || !db.objectStoreNames.contains('__meta')) return;
+        return new Promise((resolve) => {
+            try {
+                const tx = db.transaction('__meta', 'readwrite');
+                const store = tx.objectStore('__meta');
+                const record = { _id: key, ...data };
+                const request = store.put(record);
+                request.onsuccess = () => resolve();
+                request.onerror = () => resolve();
+                tx.oncomplete = () => resolve();
+            } catch (e) {
+                resolve();
+            }
+        });
     }
 
     async _initializeEncryption(pin, salt = null, config = {}) {
@@ -4808,7 +5307,7 @@ class Database {
 
         if (!this._metadata.collections[name]) {
             this._metadata.setCollection(new CollectionMetadata(
-                name, {}, this._serializer, this._base64, this.name
+                name, {}, this._serializer, this._base64, this.name, this._db
             ));
         }
         return collection;
@@ -4858,7 +5357,7 @@ class Database {
         this._collections.set(name, collection);
         if (!this._metadata.collections[name]) {
             this._metadata.setCollection(new CollectionMetadata(
-                name, {}, this._serializer, this._base64, this.name
+                name, {}, this._serializer, this._base64, this.name, this._db
             ));
         }
         return collection;
@@ -5027,7 +5526,7 @@ class Database {
 
     async export(format = 'json', password = null) {
         const data = {
-            version: '0.11.1',
+            version: '0.12.0',
             database: this.name,
             timestamp: Date.now(),
             collections: {}
@@ -5092,7 +5591,7 @@ class Database {
         await Promise.all([...this._collections.keys()].map(name => this.dropCollection(name)));
         this._collections.clear();
         if (this._metadata) this._metadata.destroy();
-        this._metadata = new DatabaseMetadata(this.name, {}, this._serializer, this._base64);
+        this._metadata = new DatabaseMetadata(this.name, {}, this._serializer, this._base64, this._db);
         this._metadata.save();
         this._quickStore.clear();
     }
@@ -5227,7 +5726,7 @@ class LacertaDB {
 
     async createBackup(password = null) {
         const backup = {
-            version: '0.11.1',
+            version: '0.12.0',
             timestamp: Date.now(),
             databases: {}
         };
