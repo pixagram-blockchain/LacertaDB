@@ -4284,7 +4284,6 @@ class Collection {
         this.database = database;
         this._serializer = database._serializer;
         this._base64 = database._base64;
-        this._db = null;           // Reference to parent's consolidated IDB connection
         this._storeName = name;    // Object store name within the consolidated database
         this._metadata = null;
         this._settings = database.settings;
@@ -4311,6 +4310,13 @@ class Collection {
         this._initialized = false;
     }
 
+    /**
+     * Live reference to parent Database's consolidated IDB connection.
+     * Always reads from the parent to avoid stale references after
+     * _ensureStore version bumps close/reopen the connection.
+     */
+    get _db() { return this.database._db; }
+
     get settings() {
         return this._settings;
     }
@@ -4328,7 +4334,6 @@ class Collection {
 
         // Use the parent Database's consolidated IDB connection
         await this.database._ensureStore(this._storeName);
-        this._db = this.database._db;
 
         // Load per-collection metadata from IDB (with localStorage migration fallback)
         this._metadata = await CollectionMetadata.loadAsync(
@@ -4539,6 +4544,24 @@ class Collection {
         this._cacheStrategy.clear();
         this._docCache.set(doc._id, newDocOutput);
         return doc._id;
+    }
+
+    /**
+     * Insert or update a document atomically.
+     * If a document with the given id exists, merges updates; otherwise creates it.
+     * @param {string} docId
+     * @param {object} data
+     * @param {object} [options]
+     * @returns {Promise<string>} Document ID
+     */
+    async upsert(docId, data, options = {}) {
+        if (!this._initialized) await this.init();
+
+        const existing = await this._indexedDB.get(this._db, this._storeName, docId);
+        if (existing) {
+            return this.update(docId, data, options);
+        }
+        return this.add(data, { ...options, id: docId });
     }
 
     async delete(docId, options = {}) {
