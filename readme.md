@@ -96,9 +96,10 @@ LacertaDB is a **browser-native** document database built for Web3 applications,
 - **Hash** indexes for O(1) exact-match lookups
 - **Full-text search** with CJK support via `Intl.Segmenter`
 - **Geospatial queries** with QuadTree-backed `$near` and `$within`
-
 </td>
-<td>
+</tr>
+</table>
+
 
 ### Performance
 
@@ -120,9 +121,6 @@ LacertaDB is a **browser-native** document database built for Web3 applications,
 | **Medium Data** (array of objects) | 334 ops/s · 4,093B | 3,460 ops/s · 4,168B | **5,587 ops/s** · 4,809B |
 | **Large Data** (TypedArray 0.2MB) | 711 ops/s · 200,005B | 341 ops/s · 200,005B | **2,703 ops/s** · 200,023B |
 
-</td>
-</tr>
-</table>
 
 ---
 

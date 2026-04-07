@@ -1,7 +1,7 @@
 {
   "name": "@pixagram/lacerta-db",
-  "version": "0.13.2",
-  "description": "Lacerta-DB is a Javascript IndexedDB Database for Web Browsers. Simple, Fast, Secure.",
+  "version": "0.13.3",
+  "description": "LacertaDB is a JS Database for Web Browsers. Up to 10x faster than others. Simple, Fast, Secure.",
   "devDependencies": {
     "@babel/core": "^7.23.6",
     "@babel/plugin-transform-optional-chaining": "^7.28.6",
@@ -22,6 +22,8 @@
   "author": "Affolter Matias",
   "keywords": [
     "indexeddb",
+    "pouchdb",
+    "rxdb",
     "database",
     "db",
     "store",

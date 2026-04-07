@@ -1448,18 +1448,27 @@ class BTreeNode {
         let i = this.n - 1;
 
         if (this.leaf) {
+            // Search first, shift only if the key is truly new.
+            // The old code shifted while scanning, which corrupted the array
+            // when the key already existed at a lower index: entries between
+            // the key's position and n-1 were duplicated rightward, leaving
+            // stale copies inside the valid range.
             while (i >= 0 && _btreeCmp(this.keys[i], key) > 0) {
-                this.keys[i + 1] = this.keys[i];
-                this.values[i + 1] = this.values[i];
                 i--;
             }
 
             if (i >= 0 && _btreeCmp(this.keys[i], key) === 0) {
+                // Key exists — merge value into existing Set (no shift needed)
                 if (!this.values[i]) {
                     this.values[i] = new Set();
                 }
                 this.values[i].add(value);
             } else {
+                // Key is new — shift entries right to open a slot at i+1
+                for (let j = this.n - 1; j > i; j--) {
+                    this.keys[j + 1] = this.keys[j];
+                    this.values[j + 1] = this.values[j];
+                }
                 this.keys[i + 1] = key;
                 this.values[i + 1] = new Set([value]);
                 this.n++;
@@ -1764,7 +1773,7 @@ class BTreeNode {
         return this._remove(key, null, true);
     }
 
-    verify() {
+    verify(isRoot = true) {
         const issues = [];
         for (let i = 0; i < this.n; i++) {
             if (this.keys[i] === undefined || this.keys[i] === null) {
@@ -1778,8 +1787,10 @@ class BTreeNode {
         }
         if (!this.leaf) {
             for (let i = 0; i <= this.n; i++) {
-                if (this.children[i]) {
-                    const childIssues = this.children[i].verify();
+                if (!this.children[i]) {
+                    issues.push(`Missing child at index ${i} (node has ${this.n} keys)`);
+                } else {
+                    const childIssues = this.children[i].verify(false);
                     issues.push(...childIssues);
                 }
             }
@@ -1932,7 +1943,8 @@ class BTreeIndex {
     /**
      * Restore a BTreeIndex from persisted sorted entries via O(n) bottom-up bulk-load.
      * Builds leaf nodes directly from sorted data, then constructs internal levels
-     * by promoting separators — no individual insert() calls, no comparisons.
+     * using pre-extracted separators — no individual insert() calls, no comparisons,
+     * and no child mutation (which avoids orphaning subtrees at depth ≥ 3).
      * @param {Array} entries - [[key, [docId1, ...]], ...] — MUST be sorted by key
      * @param {number} [order=4]
      * @returns {BTreeIndex}
@@ -1943,41 +1955,50 @@ class BTreeIndex {
 
         const maxKeys = 2 * order - 1;
 
-        // Count total values for _size
-        let totalSize = 0;
-        for (let i = 0; i < entries.length; i++) {
-            if (entries[i][0] === undefined || entries[i][0] === null) continue;
-            totalSize += entries[i][1].length;
-        }
-
-        // Filter out null/undefined keys
+        // Filter out null/undefined keys and count total values for _size
         const clean = [];
+        let totalSize = 0;
         for (let i = 0; i < entries.length; i++) {
             if (entries[i][0] !== undefined && entries[i][0] !== null) {
                 clean.push(entries[i]);
+                totalSize += entries[i][1].length;
             }
         }
 
         if (clean.length === 0) return tree;
 
-        // Step 1: Build leaf nodes, filling each to maxKeys
-        const leaves = [];
-        let pos = 0;
-        while (pos < clean.length) {
-            const node = new BTreeNode(order, true);
-            const remaining = clean.length - pos;
+        // ---------------------------------------------------------------
+        // Step 1: Build leaf nodes AND pre-extract inter-leaf separators.
+        //
+        // In a B-tree (not B+) some keys live at internal nodes. We decide
+        // up-front which entries become leaf data and which become separator
+        // keys for parent nodes. This avoids the old promote-and-shift
+        // approach which orphaned subtrees when children were non-leaf.
+        //
+        // Layout: L0  S0  L1  S1  ...  S(n-2)  L(n-1)
+        //         ↑leaf  ↑sep  ↑leaf          ↑last leaf (no trailing sep)
+        // ---------------------------------------------------------------
 
-            // How many entries for this leaf?
-            let count;
-            if (remaining <= maxKeys) {
-                // Last chunk — take everything
-                count = remaining;
-            } else if (remaining < maxKeys + order) {
-                // Would leave a tiny next leaf — split evenly
-                count = Math.ceil(remaining / 2);
-            } else {
-                count = maxKeys;
-            }
+        // How many leaves do we need?
+        // N entries = numLeaves * leafEntries + (numLeaves - 1) separators
+        // N = numLeaves * fill + numLeaves - 1 = numLeaves * (fill + 1) - 1
+        // numLeaves = ceil((N + 1) / (maxKeys + 1))
+        const numLeaves = clean.length <= maxKeys
+            ? 1
+            : Math.ceil((clean.length + 1) / (maxKeys + 1));
+
+        // Distribute entries among leaves as evenly as possible
+        const totalLeafEntries = clean.length - (numLeaves - 1); // subtract separator slots
+        const basePerLeaf = Math.floor(totalLeafEntries / numLeaves);
+        const extraLeaves = totalLeafEntries - basePerLeaf * numLeaves;
+
+        const leaves = [];
+        const separators = [];
+        let pos = 0;
+
+        for (let li = 0; li < numLeaves; li++) {
+            const count = basePerLeaf + (li < extraLeaves ? 1 : 0);
+            const node = new BTreeNode(order, true);
 
             for (let j = 0; j < count; j++) {
                 const [key, values] = clean[pos++];
@@ -1986,50 +2007,49 @@ class BTreeIndex {
                 node.n++;
             }
             leaves.push(node);
+
+            // Extract separator between this leaf and the next (not after the last)
+            if (li < numLeaves - 1) {
+                separators.push(clean[pos++]);
+            }
         }
 
-        // Step 2: Build internal levels bottom-up
+        // ---------------------------------------------------------------
+        // Step 2: Build internal levels bottom-up using pre-extracted
+        // separators. Children are never mutated, so no subtrees are lost.
+        // ---------------------------------------------------------------
         let level = leaves;
+        let seps = separators;
+
         while (level.length > 1) {
             const parents = [];
-            let ci = 0;
+            const nextSeps = [];
+            let ci = 0; // child index into level
+            let si = 0; // separator index into seps
 
             while (ci < level.length) {
                 const parent = new BTreeNode(order, false);
                 parent.children[0] = level[ci++];
 
-                // Promote first key from each subsequent child as separator
-                while (parent.n < maxKeys && ci < level.length) {
-                    const child = level[ci];
-
-                    // Promote child's first key+values as separator in parent
-                    parent.keys[parent.n] = child.keys[0];
-                    parent.values[parent.n] = child.values[0];
-
-                    // Shift child entries left to remove promoted key
-                    for (let j = 0; j < child.n - 1; j++) {
-                        child.keys[j] = child.keys[j + 1];
-                        child.values[j] = child.values[j + 1];
-                    }
-                    if (!child.leaf) {
-                        for (let j = 0; j < child.n; j++) {
-                            child.children[j] = child.children[j + 1];
-                        }
-                        child.children[child.n] = undefined;
-                    }
-                    child.keys[child.n - 1] = undefined;
-                    child.values[child.n - 1] = undefined;
-                    child.n--;
-
-                    parent.children[parent.n + 1] = child;
+                // Attach children with their pre-extracted separators
+                while (parent.n < maxKeys && si < seps.length && ci < level.length) {
+                    const [sepKey, sepValues] = seps[si++];
+                    parent.keys[parent.n] = sepKey;
+                    parent.values[parent.n] = new Set(sepValues);
+                    parent.children[parent.n + 1] = level[ci++];
                     parent.n++;
-                    ci++;
                 }
 
                 parents.push(parent);
+
+                // Extract separator between this parent and the next
+                if (ci < level.length && si < seps.length) {
+                    nextSeps.push(seps[si++]);
+                }
             }
 
             level = parents;
+            seps = nextSeps;
         }
 
         tree._root = level[0];
