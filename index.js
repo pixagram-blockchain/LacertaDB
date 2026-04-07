@@ -439,7 +439,15 @@ class LRUCache {
 
     delete(key) { return this._cache.delete(key); }
     clear() { this._cache.clear(); }
-    has(key) { return this.get(key) !== null; }
+    has(key) {
+        const item = this._cache.get(key);
+        if (!item) return false;
+        if (this._ttl && (Date.now() - item.ts > this._ttl)) {
+            this._cache.delete(key);
+            return false;
+        }
+        return true;
+    }
     get size() { return this._cache.size; }
 }
 
@@ -755,18 +763,38 @@ class BrowserCompressionUtility {
         }
     }
 
+    /**
+     * Synchronous "compression" — real CompressionStream requires async,
+     * so we prepend the raw marker (0x00) for format compatibility with
+     * the async decompress path. Without this marker, a doc packed via
+     * packSync could be silently misread by the async unpack path.
+     */
     compressSync(input) {
         if (!(input instanceof Uint8Array)) {
             throw new TypeError('Input must be Uint8Array');
         }
-        return input;
+        const result = new Uint8Array(input.byteLength + 1);
+        result[0] = 0x00; // Raw marker
+        result.set(input, 1);
+        return result;
     }
 
     decompressSync(input) {
         if (!(input instanceof Uint8Array)) {
             throw new TypeError('Input must be Uint8Array');
         }
-        return input;
+        if (input.length === 0) return input;
+
+        const marker = input[0];
+        if (marker === 0x01) {
+            // Deflate-compressed data — can't decompress synchronously
+            throw new LacertaDBError(
+                'Cannot synchronously decompress deflate data. Use async unpack() instead.',
+                'SYNC_DECOMPRESS_NOT_SUPPORTED'
+            );
+        }
+        // 0x00 (raw) or legacy (no marker): strip marker if present
+        return marker === 0x00 ? input.slice(1) : input;
     }
 }
 
@@ -1261,6 +1289,36 @@ class QuadTree {
             this.southwest.remove(id);
             this.southeast.remove(id);
         }
+    }
+
+    /**
+     * Targeted removal: navigate to the quad containing (x, y) and remove
+     * the point with matching data. O(log n) instead of O(n) full scan.
+     * @param {number} x - Longitude
+     * @param {number} y - Latitude
+     * @param {*} id - Document ID
+     * @returns {boolean} true if removed
+     */
+    removeAt(x, y, id) {
+        if (!this._contains(this.boundary, { x, y })) return false;
+
+        // Try to remove from this node's points
+        for (let i = 0; i < this.points.length; i++) {
+            if (this.points[i].data === id) {
+                this.points.splice(i, 1);
+                return true;
+            }
+        }
+
+        // Navigate into the correct child quad
+        if (this.divided) {
+            return this.northeast.removeAt(x, y, id) ||
+                this.northwest.removeAt(x, y, id) ||
+                this.southeast.removeAt(x, y, id) ||
+                this.southwest.removeAt(x, y, id);
+        }
+
+        return false;
     }
 
     _subdivide() {
@@ -1872,21 +1930,110 @@ class BTreeIndex {
     }
 
     /**
-     * Restore a BTreeIndex from persisted sorted entries.
-     * Much faster than full document scan + unpack.
-     * @param {Array} entries - [[key, [docId1, ...]], ...]
+     * Restore a BTreeIndex from persisted sorted entries via O(n) bottom-up bulk-load.
+     * Builds leaf nodes directly from sorted data, then constructs internal levels
+     * by promoting separators — no individual insert() calls, no comparisons.
+     * @param {Array} entries - [[key, [docId1, ...]], ...] — MUST be sorted by key
      * @param {number} [order=4]
      * @returns {BTreeIndex}
      */
     static fromSortedEntries(entries, order = 4) {
         const tree = new BTreeIndex(order);
+        if (entries.length === 0) return tree;
+
+        const maxKeys = 2 * order - 1;
+
+        // Count total values for _size
+        let totalSize = 0;
         for (let i = 0; i < entries.length; i++) {
-            const [key, values] = entries[i];
-            if (key === undefined || key === null) continue;
-            for (let j = 0; j < values.length; j++) {
-                tree.insert(key, values[j]);
+            if (entries[i][0] === undefined || entries[i][0] === null) continue;
+            totalSize += entries[i][1].length;
+        }
+
+        // Filter out null/undefined keys
+        const clean = [];
+        for (let i = 0; i < entries.length; i++) {
+            if (entries[i][0] !== undefined && entries[i][0] !== null) {
+                clean.push(entries[i]);
             }
         }
+
+        if (clean.length === 0) return tree;
+
+        // Step 1: Build leaf nodes, filling each to maxKeys
+        const leaves = [];
+        let pos = 0;
+        while (pos < clean.length) {
+            const node = new BTreeNode(order, true);
+            const remaining = clean.length - pos;
+
+            // How many entries for this leaf?
+            let count;
+            if (remaining <= maxKeys) {
+                // Last chunk — take everything
+                count = remaining;
+            } else if (remaining < maxKeys + order) {
+                // Would leave a tiny next leaf — split evenly
+                count = Math.ceil(remaining / 2);
+            } else {
+                count = maxKeys;
+            }
+
+            for (let j = 0; j < count; j++) {
+                const [key, values] = clean[pos++];
+                node.keys[j] = key;
+                node.values[j] = new Set(values);
+                node.n++;
+            }
+            leaves.push(node);
+        }
+
+        // Step 2: Build internal levels bottom-up
+        let level = leaves;
+        while (level.length > 1) {
+            const parents = [];
+            let ci = 0;
+
+            while (ci < level.length) {
+                const parent = new BTreeNode(order, false);
+                parent.children[0] = level[ci++];
+
+                // Promote first key from each subsequent child as separator
+                while (parent.n < maxKeys && ci < level.length) {
+                    const child = level[ci];
+
+                    // Promote child's first key+values as separator in parent
+                    parent.keys[parent.n] = child.keys[0];
+                    parent.values[parent.n] = child.values[0];
+
+                    // Shift child entries left to remove promoted key
+                    for (let j = 0; j < child.n - 1; j++) {
+                        child.keys[j] = child.keys[j + 1];
+                        child.values[j] = child.values[j + 1];
+                    }
+                    if (!child.leaf) {
+                        for (let j = 0; j < child.n; j++) {
+                            child.children[j] = child.children[j + 1];
+                        }
+                        child.children[child.n] = undefined;
+                    }
+                    child.keys[child.n - 1] = undefined;
+                    child.values[child.n - 1] = undefined;
+                    child.n--;
+
+                    parent.children[parent.n + 1] = child;
+                    parent.n++;
+                    ci++;
+                }
+
+                parents.push(parent);
+            }
+
+            level = parents;
+        }
+
+        tree._root = level[0];
+        tree._size = totalSize;
         return tree;
     }
 }
@@ -1991,6 +2138,63 @@ class TextIndex {
     get size() {
         return this._docTokens.size;
     }
+
+    /**
+     * Export index state for persistence.
+     * Only the inverted index is stored — _docTokens is derived on restore.
+     * Format: { invertedIndex: [[token, [docId, ...]], ...] }
+     * @returns {Object}
+     */
+    toSerializable() {
+        const invertedIndex = [];
+        for (const [token, docIds] of this._invertedIndex) {
+            invertedIndex.push([token, Array.from(docIds)]);
+        }
+        return { invertedIndex };
+    }
+
+    /**
+     * Restore a TextIndex from persisted data.
+     * Rebuilds both _invertedIndex and _docTokens from the serialized inverted index.
+     * @param {Object} data - { invertedIndex: [[token, [docId, ...]], ...] }
+     * @returns {TextIndex}
+     */
+    static fromSerialized(data) {
+        const idx = new TextIndex();
+        if (!data || !Array.isArray(data.invertedIndex)) return idx;
+
+        for (const [token, docIds] of data.invertedIndex) {
+            const docSet = new Set(docIds);
+            idx._invertedIndex.set(token, docSet);
+            // Derive _docTokens from inverted index
+            for (const docId of docIds) {
+                if (!idx._docTokens.has(docId)) idx._docTokens.set(docId, new Set());
+                idx._docTokens.get(docId).add(token);
+            }
+        }
+        return idx;
+    }
+
+    /**
+     * Verify index integrity. TextIndex is always healthy if it loaded.
+     * @returns {{ healthy: boolean, issues: Array, requiresRebuild: boolean }}
+     */
+    verify() {
+        const issues = [];
+        // Cross-check: every docId in _invertedIndex must appear in _docTokens
+        for (const [token, docIds] of this._invertedIndex) {
+            for (const docId of docIds) {
+                if (!this._docTokens.has(docId)) {
+                    issues.push(`Token '${token}' references unknown docId '${docId}'`);
+                }
+            }
+        }
+        return {
+            healthy: issues.length === 0,
+            issues,
+            requiresRebuild: issues.length > 0
+        };
+    }
 }
 
 // ========================
@@ -2001,6 +2205,8 @@ class GeoIndex {
     constructor() {
         this._tree = new QuadTree({x: 0, y: 0, w: 180, h: 90});
         this._size = 0;
+        // Coordinate lookup: docId → {x, y} for O(log n) targeted removal
+        this._pointLookup = new Map();
     }
 
     addPoint(coords, docId) {
@@ -2008,11 +2214,20 @@ class GeoIndex {
             return;
         }
         this._tree.insert({x: coords.lng, y: coords.lat, data: docId});
+        this._pointLookup.set(docId, { x: coords.lng, y: coords.lat });
         this._size++;
     }
 
     removePoint(docId) {
-        this._tree.remove(docId);
+        const coords = this._pointLookup.get(docId);
+        if (coords) {
+            // Targeted removal: navigate to the correct quad and remove there
+            this._tree.removeAt(coords.x, coords.y, docId);
+            this._pointLookup.delete(docId);
+        } else {
+            // Fallback: full-tree scan (shouldn't happen if data is consistent)
+            this._tree.remove(docId);
+        }
         if (this._size > 0) this._size--;
     }
 
@@ -2083,6 +2298,178 @@ class GeoIndex {
 
     get size() {
         return this._size;
+    }
+
+    /**
+     * Export all points for persistence.
+     * Uses Float64Array for coordinates (TurboSerial handles TypedArrays natively).
+     * Format: { coords: Float64Array([lng0, lat0, lng1, lat1, ...]), docIds: [id0, id1, ...] }
+     * @returns {Object}
+     */
+    toSerializable() {
+        const points = [];
+        this._collectAllPoints(this._tree, points);
+
+        const coords = new Float64Array(points.length * 2);
+        const docIds = new Array(points.length);
+
+        for (let i = 0; i < points.length; i++) {
+            coords[i * 2]     = points[i].x; // lng
+            coords[i * 2 + 1] = points[i].y; // lat
+            docIds[i] = points[i].data;       // docId
+        }
+
+        return { coords, docIds };
+    }
+
+    /**
+     * Recursively collect all points from the QuadTree.
+     * @param {QuadTree} node
+     * @param {Array} points
+     * @private
+     */
+    _collectAllPoints(node, points) {
+        for (const p of node.points) {
+            points.push(p);
+        }
+        if (node.divided) {
+            this._collectAllPoints(node.northeast, points);
+            this._collectAllPoints(node.northwest, points);
+            this._collectAllPoints(node.southeast, points);
+            this._collectAllPoints(node.southwest, points);
+        }
+    }
+
+    /**
+     * Restore a GeoIndex from persisted data.
+     * @param {Object} data - { coords: Float64Array, docIds: Array }
+     * @returns {GeoIndex}
+     */
+    static fromSerialized(data) {
+        const idx = new GeoIndex();
+        if (!data || !data.coords || !data.docIds) return idx;
+
+        const { coords, docIds } = data;
+        for (let i = 0; i < docIds.length; i++) {
+            idx.addPoint(
+                { lng: coords[i * 2], lat: coords[i * 2 + 1] },
+                docIds[i]
+            );
+        }
+        return idx;
+    }
+
+    /**
+     * Verify index integrity.
+     * @returns {{ healthy: boolean, issues: Array, requiresRebuild: boolean }}
+     */
+    verify() {
+        // Verify size consistency: count all points vs _size
+        const points = [];
+        this._collectAllPoints(this._tree, points);
+        const issues = [];
+        if (points.length !== this._size) {
+            issues.push(`Size mismatch: _size=${this._size}, actual=${points.length}`);
+        }
+        return {
+            healthy: issues.length === 0,
+            issues,
+            requiresRebuild: issues.length > 0
+        };
+    }
+}
+
+// ========================
+// Index Manager (Cursor Optimized)
+// ========================
+
+// ========================
+// Hash Index (O(1) Lookup)
+// ========================
+
+class HashIndex {
+    constructor() {
+        this._map = new Map(); // value → Set<docId>
+    }
+
+    insert(value, docId) {
+        let bucket = this._map.get(value);
+        if (!bucket) {
+            bucket = new Set();
+            this._map.set(value, bucket);
+        }
+        bucket.add(docId);
+    }
+
+    find(value) {
+        const bucket = this._map.get(value);
+        return bucket ? Array.from(bucket) : [];
+    }
+
+    remove(value, docId) {
+        const bucket = this._map.get(value);
+        if (bucket) {
+            bucket.delete(docId);
+            if (bucket.size === 0) this._map.delete(value);
+        }
+    }
+
+    has(value) {
+        return this._map.has(value);
+    }
+
+    clear() {
+        this._map.clear();
+    }
+
+    get size() {
+        let count = 0;
+        for (const bucket of this._map.values()) count += bucket.size;
+        return count;
+    }
+
+    /**
+     * Export for persistence. Format: [[value, [docId, ...]], ...]
+     * @returns {Array}
+     */
+    toSerializable() {
+        const entries = [];
+        for (const [value, docIds] of this._map) {
+            entries.push([value, Array.from(docIds)]);
+        }
+        return entries;
+    }
+
+    /**
+     * Restore from persisted data.
+     * @param {Array} entries - [[value, [docId, ...]], ...]
+     * @returns {HashIndex}
+     */
+    static fromSerialized(entries) {
+        const idx = new HashIndex();
+        if (!Array.isArray(entries)) return idx;
+        for (const [value, docIds] of entries) {
+            idx._map.set(value, new Set(docIds));
+        }
+        return idx;
+    }
+
+    /**
+     * Verify index integrity.
+     * @returns {{ healthy: boolean, issues: Array, requiresRebuild: boolean }}
+     */
+    verify() {
+        const issues = [];
+        for (const [value, bucket] of this._map) {
+            if (!(bucket instanceof Set)) {
+                issues.push(`Value '${value}' has non-Set bucket`);
+            }
+        }
+        return {
+            healthy: issues.length === 0,
+            issues,
+            requiresRebuild: issues.length > 0
+        };
     }
 }
 
@@ -2207,14 +2594,17 @@ class IndexManager {
     }
 
     /**
-     * FAST PATH: Restore a BTree index from persisted entries stored in IDB.
+     * FAST PATH: Restore an index from persisted entries stored in IDB.
      * Returns true if successful, false if persisted data is missing/corrupt.
+     *
+     * Supported types: btree, text, geo, hash
+     *
      * @param {string} indexName
      * @returns {Promise<boolean>}
      */
     async _restoreIndex(indexName) {
         const index = this._indexes.get(indexName);
-        if (!index || index.type !== 'btree') return false;
+        if (!index) return false;
 
         try {
             const docId = `${IndexManager.IDX_PREFIX}${indexName}`;
@@ -2222,21 +2612,66 @@ class IndexManager {
                 this._collection._db, this._collection._storeName, docId
             );
 
-            if (!stored || !stored._entries || !Array.isArray(stored._entries)) {
+            if (!stored) return false;
+
+            // Type guard: reject if persisted type doesn't match current definition
+            if (stored._type && stored._type !== index.type) {
+                console.warn(`[IndexManager] Type mismatch for '${indexName}': stored=${stored._type}, expected=${index.type}`);
                 return false;
             }
 
-            // Restore B-Tree from sorted entries — no document scanning needed
-            const btree = BTreeIndex.fromSortedEntries(stored._entries, 4);
+            let restored = null;
 
-            // Quick sanity check
-            const v = btree.verify();
-            if (!v.healthy) {
-                console.warn(`[IndexManager] Persisted index '${indexName}' is corrupt, will rebuild`);
-                return false;
+            switch (index.type) {
+                case 'btree': {
+                    if (!stored._entries || !Array.isArray(stored._entries)) return false;
+                    restored = BTreeIndex.fromSortedEntries(stored._entries, 4);
+                    const v = restored.verify();
+                    if (!v.healthy) {
+                        console.warn(`[IndexManager] Persisted btree '${indexName}' is corrupt, will rebuild`);
+                        return false;
+                    }
+                    break;
+                }
+
+                case 'text': {
+                    if (!stored._data || !stored._data.invertedIndex) return false;
+                    restored = TextIndex.fromSerialized(stored._data);
+                    const v = restored.verify();
+                    if (!v.healthy) {
+                        console.warn(`[IndexManager] Persisted text index '${indexName}' is corrupt, will rebuild`);
+                        return false;
+                    }
+                    break;
+                }
+
+                case 'geo': {
+                    if (!stored._data || !stored._data.coords || !stored._data.docIds) return false;
+                    restored = GeoIndex.fromSerialized(stored._data);
+                    const v = restored.verify();
+                    if (!v.healthy) {
+                        console.warn(`[IndexManager] Persisted geo index '${indexName}' is corrupt, will rebuild`);
+                        return false;
+                    }
+                    break;
+                }
+
+                case 'hash': {
+                    if (!stored._entries || !Array.isArray(stored._entries)) return false;
+                    restored = HashIndex.fromSerialized(stored._entries);
+                    const v = restored.verify();
+                    if (!v.healthy) {
+                        console.warn(`[IndexManager] Persisted hash index '${indexName}' is corrupt, will rebuild`);
+                        return false;
+                    }
+                    break;
+                }
+
+                default:
+                    return false;
             }
 
-            this._indexData.set(indexName, btree);
+            this._indexData.set(indexName, restored);
             return true;
         } catch (e) {
             return false;
@@ -2244,22 +2679,55 @@ class IndexManager {
     }
 
     /**
-     * Persist a single BTree index's entries to IDB.
+     * Persist a single index's entries to IDB.
      * Stored as a document with reserved _id in the existing 'documents' store.
+     *
+     * Supported types:
+     *   btree → toSortedEntries()
+     *   text  → TextIndex.toSerializable()
+     *   geo   → GeoIndex.toSerializable() (Float64Array coords)
+     *   hash  → [[value, [docId, ...]], ...]
+     *
      * @param {string} indexName
      */
     async _persistIndex(indexName) {
         const indexData = this._indexData.get(indexName);
-        if (!indexData || !(indexData instanceof BTreeIndex)) return;
+        const index = this._indexes.get(indexName);
+        if (!indexData || !index) return;
 
         try {
             const docId = `${IndexManager.IDX_PREFIX}${indexName}`;
             const payload = {
                 _id: docId,
-                _entries: indexData.toSortedEntries(),
+                _type: index.type,
                 _persisted_at: Date.now(),
-                _size: indexData.size
+                _size: indexData.size || 0
             };
+
+            switch (index.type) {
+                case 'btree':
+                    if (!(indexData instanceof BTreeIndex)) return;
+                    payload._entries = indexData.toSortedEntries();
+                    break;
+
+                case 'text':
+                    if (!(indexData instanceof TextIndex)) return;
+                    payload._data = indexData.toSerializable();
+                    break;
+
+                case 'geo':
+                    if (!(indexData instanceof GeoIndex)) return;
+                    payload._data = indexData.toSerializable();
+                    break;
+
+                case 'hash':
+                    if (!(indexData instanceof HashIndex)) return;
+                    payload._entries = indexData.toSerializable();
+                    break;
+
+                default:
+                    return; // Unknown type, skip
+            }
 
             await this._collection._indexedDB.put(
                 this._collection._db, this._collection._storeName, payload
@@ -2308,13 +2776,13 @@ class IndexManager {
             case 'btree':
                 return new BTreeIndex();
             case 'hash':
-                return new Map();
+                return new HashIndex();
             case 'text':
                 return new TextIndex();
             case 'geo':
                 return new GeoIndex();
             default:
-                return new Map();
+                return new HashIndex();
         }
     }
 
@@ -2324,10 +2792,7 @@ class IndexManager {
                 indexData.insert(value, docId);
                 break;
             case 'hash':
-                if (!indexData.has(value)) {
-                    indexData.set(value, new Set());
-                }
-                indexData.get(value).add(docId);
+                indexData.insert(value, docId);
                 break;
             case 'text':
                 indexData.addDocument(value, docId);
@@ -2365,17 +2830,8 @@ class IndexManager {
                     if (newValue !== undefined) indexData.insert(newValue, docId);
                     break;
                 case 'hash':
-                    if (oldValue !== undefined) {
-                        const oldSet = indexData.get(oldValue);
-                        if (oldSet) {
-                            oldSet.delete(docId);
-                            if (oldSet.size === 0) indexData.delete(oldValue);
-                        }
-                    }
-                    if (newValue !== undefined) {
-                        if (!indexData.has(newValue)) indexData.set(newValue, new Set());
-                        indexData.get(newValue).add(docId);
-                    }
+                    if (oldValue !== undefined) indexData.remove(oldValue, docId);
+                    if (newValue !== undefined) indexData.insert(newValue, docId);
                     break;
                 case 'text':
                     if (oldValue || newValue) {
@@ -2388,10 +2844,8 @@ class IndexManager {
                     break;
             }
 
-            // Schedule async persistence for modified btree indexes
-            if (index.type === 'btree') {
-                this._schedulePersist(indexName);
-            }
+            // Schedule async persistence for modified indexes (all types)
+            this._schedulePersist(indexName);
         }
     }
 
@@ -2457,17 +2911,14 @@ class IndexManager {
 
     _queryHash(indexData, options) {
         if (options.$eq !== undefined) {
-            const docs = indexData.get(options.$eq);
-            return docs ? Array.from(docs) : [];
+            return indexData.find(options.$eq);
         }
 
         if (options.$in !== undefined) {
             const results = new Set();
             for (const value of options.$in) {
-                const docs = indexData.get(value);
-                if (docs) {
-                    docs.forEach(doc => results.add(doc));
-                }
+                const docs = indexData.find(value);
+                for (let i = 0; i < docs.length; i++) results.add(docs[i]);
             }
             return Array.from(results);
         }
@@ -2583,13 +3034,8 @@ class IndexManager {
             const needsRebuild = [];
 
             for (const [indexName, index] of this._indexes) {
-                if (index.type === 'btree') {
-                    const restored = await this._restoreIndex(indexName);
-                    if (!restored) {
-                        needsRebuild.push(indexName);
-                    }
-                } else {
-                    // Non-btree indexes (text, geo, hash) always need rebuild
+                const restored = await this._restoreIndex(indexName);
+                if (!restored) {
                     needsRebuild.push(indexName);
                 }
             }
@@ -2620,8 +3066,17 @@ class IndexManager {
 
     _estimateMemoryUsage(indexData) {
         if (!indexData) return 0;
-        if (indexData instanceof Map) return indexData.size * 100;
         if (indexData instanceof BTreeIndex) return indexData.size * 120;
+        if (indexData instanceof TextIndex) {
+            // Rough estimate: inverted index entries + docTokens forward map
+            let bytes = 0;
+            for (const [token, docIds] of indexData._invertedIndex) {
+                bytes += token.length * 2 + docIds.size * 64;
+            }
+            return bytes;
+        }
+        if (indexData instanceof GeoIndex) return indexData.size * 80;
+        if (indexData instanceof HashIndex) return indexData.size * 100;
         return 0;
     }
 
@@ -3158,11 +3613,31 @@ class CollectionMetadata {
         this.createdAt = data.createdAt || Date.now();
         this.modifiedAt = data.modifiedAt || Date.now();
 
-        // Per-document tracking (in-memory Maps for O(1) ops)
-        this._docSizes = new Map(data._docSizes || []);        // docId -> sizeKB
-        this._docModified = new Map(data._docModified || []);   // docId -> timestamp
-        this._docPermanent = new Map(data._docPermanent || []); // docId -> boolean
-        this._docAttachments = new Map(data._docAttachments || []); // docId -> count
+        // Per-document tracking: single Map<docId, {size, modified, permanent, attachments}>
+        // Halves Map overhead vs. 4 separate Maps with identical key sets.
+        this._docMeta = new Map();
+
+        // Hydrate from persisted data (supports both old 4-map and new unified format)
+        if (data._docMeta) {
+            // New unified format
+            for (const [docId, meta] of data._docMeta) {
+                this._docMeta.set(docId, meta);
+            }
+        } else if (data._docSizes) {
+            // Legacy 4-map format — migrate on load
+            const sizes = new Map(data._docSizes);
+            const modified = new Map(data._docModified || []);
+            const permanent = new Map(data._docPermanent || []);
+            const attachments = new Map(data._docAttachments || []);
+            for (const [docId, size] of sizes) {
+                this._docMeta.set(docId, {
+                    size,
+                    modified: modified.get(docId) || Date.now(),
+                    permanent: permanent.get(docId) || false,
+                    attachments: attachments.get(docId) || 0
+                });
+            }
+        }
 
         // Debounced persistence
         this._dirty = false;
@@ -3177,10 +3652,12 @@ class CollectionMetadata {
     // ---- Mutations (in-memory only, schedule async save) ----
 
     addDocument(docId, sizeKB, isPermanent = false, attachmentCount = 0) {
-        this._docSizes.set(docId, sizeKB);
-        this._docModified.set(docId, Date.now());
-        this._docPermanent.set(docId, isPermanent);
-        this._docAttachments.set(docId, attachmentCount);
+        this._docMeta.set(docId, {
+            size: sizeKB,
+            modified: Date.now(),
+            permanent: isPermanent,
+            attachments: attachmentCount
+        });
 
         this.sizeKB += sizeKB;
         this.length++;
@@ -3189,27 +3666,28 @@ class CollectionMetadata {
     }
 
     updateDocument(docId, newSizeKB, isPermanent = false, attachmentCount = 0) {
-        const oldSize = this._docSizes.get(docId) || 0;
+        const existing = this._docMeta.get(docId);
+        const oldSize = existing ? existing.size : 0;
         this.sizeKB = this.sizeKB - oldSize + newSizeKB;
 
-        this._docSizes.set(docId, newSizeKB);
-        this._docModified.set(docId, Date.now());
-        this._docPermanent.set(docId, isPermanent);
-        this._docAttachments.set(docId, attachmentCount);
+        this._docMeta.set(docId, {
+            size: newSizeKB,
+            modified: Date.now(),
+            permanent: isPermanent,
+            attachments: attachmentCount
+        });
 
         this.modifiedAt = Date.now();
         this._scheduleSave();
     }
 
     removeDocument(docId) {
-        const sizeKB = this._docSizes.get(docId) || 0;
+        const existing = this._docMeta.get(docId);
+        const sizeKB = existing ? existing.size : 0;
         this.sizeKB -= sizeKB;
         this.length--;
 
-        this._docSizes.delete(docId);
-        this._docModified.delete(docId);
-        this._docPermanent.delete(docId);
-        this._docAttachments.delete(docId);
+        this._docMeta.delete(docId);
 
         this.modifiedAt = Date.now();
         this._scheduleSave();
@@ -3219,9 +3697,9 @@ class CollectionMetadata {
 
     getOldestNonPermanentDocuments(count) {
         const candidates = [];
-        for (const [docId, modified] of this._docModified) {
-            if (!this._docPermanent.get(docId)) {
-                candidates.push({ id: docId, modified });
+        for (const [docId, meta] of this._docMeta) {
+            if (!meta.permanent) {
+                candidates.push({ id: docId, modified: meta.modified });
             }
         }
         candidates.sort((a, b) => a.modified - b.modified);
@@ -3229,15 +3707,17 @@ class CollectionMetadata {
     }
 
     getDocumentSize(docId) {
-        return this._docSizes.get(docId) || 0;
+        const meta = this._docMeta.get(docId);
+        return meta ? meta.size : 0;
     }
 
     isDocumentPermanent(docId) {
-        return this._docPermanent.get(docId) || false;
+        const meta = this._docMeta.get(docId);
+        return meta ? meta.permanent : false;
     }
 
     hasDocument(docId) {
-        return this._docSizes.has(docId);
+        return this._docMeta.has(docId);
     }
 
     // ---- Aggregate snapshot (for DatabaseMetadata) ----
@@ -3284,10 +3764,7 @@ class CollectionMetadata {
             length: this.length,
             createdAt: this.createdAt,
             modifiedAt: this.modifiedAt,
-            _docSizes: Array.from(this._docSizes.entries()),
-            _docModified: Array.from(this._docModified.entries()),
-            _docPermanent: Array.from(this._docPermanent.entries()),
-            _docAttachments: Array.from(this._docAttachments.entries())
+            _docMeta: Array.from(this._docMeta.entries())
         };
 
         try {
@@ -3403,10 +3880,7 @@ class CollectionMetadata {
         this.sizeKB = 0;
         this.length = 0;
         this.modifiedAt = Date.now();
-        this._docSizes.clear();
-        this._docModified.clear();
-        this._docPermanent.clear();
-        this._docAttachments.clear();
+        this._docMeta.clear();
         this._dirty = true;
         this._flushSync();
     }
@@ -3722,6 +4196,10 @@ class QueryEngine {
         // Path cache: avoids repeated path.split('.') allocations during scans
         this._pathCache = new Map();
 
+        // Pre-compiled Set cache for $in/$nin/$all operators.
+        // Avoids rebuilding on every per-document call during a query scan.
+        this._setCache = new WeakMap();
+
         this.operators = {
             '$eq': (a, b) => a === b,
             '$ne': (a, b) => a !== b,
@@ -3729,8 +4207,18 @@ class QueryEngine {
             '$gte': (a, b) => a >= b,
             '$lt': (a, b) => a < b,
             '$lte': (a, b) => a <= b,
-            '$in': (a, b) => Array.isArray(b) && b.includes(a),
-            '$nin': (a, b) => Array.isArray(b) && !b.includes(a),
+            '$in': (a, b) => {
+                if (!Array.isArray(b)) return false;
+                let s = this._setCache.get(b);
+                if (!s) { s = new Set(b); this._setCache.set(b, s); }
+                return s.has(a);
+            },
+            '$nin': (a, b) => {
+                if (!Array.isArray(b)) return false;
+                let s = this._setCache.get(b);
+                if (!s) { s = new Set(b); this._setCache.set(b, s); }
+                return !s.has(a);
+            },
 
             '$and': (doc, conditions) => conditions.every(cond => this.evaluate(doc, cond)),
             '$or': (doc, conditions) => conditions.some(cond => this.evaluate(doc, cond)),
@@ -3740,7 +4228,12 @@ class QueryEngine {
             '$exists': (value, exists) => (value !== undefined) === exists,
             '$type': (value, type) => typeof value === type,
 
-            '$all': (arr, values) => Array.isArray(arr) && values.every(v => arr.includes(v)),
+            '$all': (arr, values) => {
+                if (!Array.isArray(arr)) return false;
+                let s = this._setCache.get(arr);
+                if (!s) { s = new Set(arr); this._setCache.set(arr, s); }
+                return values.every(v => s.has(v));
+            },
             '$elemMatch': (arr, condition) => Array.isArray(arr) && arr.some(elem => this.evaluate({ value: elem }, { value: condition })),
             '$size': (arr, size) => Array.isArray(arr) && arr.length === size,
 
@@ -3790,13 +4283,11 @@ class QueryEngine {
             this._pathCache.set(path, parts);
             // Cap cache size to prevent unbounded growth
             if (this._pathCache.size > 2000) {
-                // Delete oldest entries (first 500)
+                // Delete oldest 500 entries
                 const iter = this._pathCache.keys();
-                for (let i = 0; i < 500; i++) iter.next();
-                // Rebuild with remaining
-                const newCache = new Map();
-                for (const [k, v] of this._pathCache) newCache.set(k, v);
-                this._pathCache = newCache;
+                for (let i = 0; i < 500; i++) {
+                    this._pathCache.delete(iter.next().value);
+                }
             }
         }
         return parts;
@@ -3935,10 +4426,16 @@ class AggregationPipeline {
                                 result[fieldKey] = group.docs.length;
                                 break;
                             case '$max':
-                                result[fieldKey] = Math.max(...group.docs.map(d => queryEngine.getFieldValue(d, field)));
+                                result[fieldKey] = group.docs.reduce((max, d) => {
+                                    const v = queryEngine.getFieldValue(d, field);
+                                    return v !== undefined && (max === undefined || v > max) ? v : max;
+                                }, undefined);
                                 break;
                             case '$min':
-                                result[fieldKey] = Math.min(...group.docs.map(d => queryEngine.getFieldValue(d, field)));
+                                result[fieldKey] = group.docs.reduce((min, d) => {
+                                    const v = queryEngine.getFieldValue(d, field);
+                                    return v !== undefined && (min === undefined || v < min) ? v : min;
+                                }, undefined);
                                 break;
                         }
                     }
@@ -4098,11 +4595,17 @@ class MigrationManager {
         for (const collectionName of collections) {
             const coll = await this.database.getCollection(collectionName);
             const docs = await coll.getAll();
+
+            // Collect all updates, then apply in a single batch transaction
+            const updates = [];
             for (const doc of docs) {
                 const updated = await migration[direction](doc);
                 if (updated) {
-                    await coll.update(doc._id, updated);
+                    updates.push({ id: doc._id, data: updated });
                 }
+            }
+            if (updates.length > 0) {
+                await coll.batchUpdate(updates);
             }
         }
     }
@@ -4114,13 +4617,18 @@ class MigrationManager {
 
 class PerformanceMonitor {
     constructor() {
-        this._metrics = {
-            operations: [],
-            latencies: [],
-            cacheHits: 0,
-            cacheMisses: 0,
-            memoryUsage: []
-        };
+        // Fixed-size ring buffers — O(1) insert, no shift() overhead
+        this._ops = new Array(100);
+        this._opsIdx = 0;
+        this._opsLen = 0;
+        this._lats = new Float64Array(100);
+        this._latsIdx = 0;
+        this._latsLen = 0;
+        this._mem = new Array(60);
+        this._memIdx = 0;
+        this._memLen = 0;
+        this._cacheHits = 0;
+        this._cacheMisses = 0;
         this._monitoring = false;
         this._monitoringInterval = null;
     }
@@ -4140,35 +4648,56 @@ class PerformanceMonitor {
 
     recordOperation(type, duration) {
         if (!this._monitoring) return;
-        this._metrics.operations.push({ type, duration, timestamp: Date.now() });
-        this._metrics.latencies.push(duration);
-        if (this._metrics.operations.length > 100) this._metrics.operations.shift();
-        if (this._metrics.latencies.length > 100) this._metrics.latencies.shift();
+        this._ops[this._opsIdx] = { type, duration, timestamp: Date.now() };
+        this._opsIdx = (this._opsIdx + 1) % 100;
+        if (this._opsLen < 100) this._opsLen++;
+        this._lats[this._latsIdx] = duration;
+        this._latsIdx = (this._latsIdx + 1) % 100;
+        if (this._latsLen < 100) this._latsLen++;
     }
 
-    recordCacheHit() { this._metrics.cacheHits++; }
-    recordCacheMiss() { this._metrics.cacheMisses++; }
+    recordCacheHit() { this._cacheHits++; }
+    recordCacheMiss() { this._cacheMisses++; }
 
     _collectMetrics() {
         if (performance && performance.memory) {
-            this._metrics.memoryUsage.push({
+            this._mem[this._memIdx] = {
                 used: performance.memory.usedJSHeapSize,
                 total: performance.memory.totalJSHeapSize,
                 limit: performance.memory.jsHeapSizeLimit,
                 timestamp: Date.now()
-            });
-            if (this._metrics.memoryUsage.length > 60) this._metrics.memoryUsage.shift();
+            };
+            this._memIdx = (this._memIdx + 1) % 60;
+            if (this._memLen < 60) this._memLen++;
         }
     }
 
-    getStats() {
-        const opsPerSec = this._metrics.operations.filter(op => Date.now() - op.timestamp < 1000).length;
-        const totalLatency = this._metrics.latencies.reduce((a, b) => a + b, 0);
-        const avgLatency = this._metrics.latencies.length > 0 ? totalLatency / this._metrics.latencies.length : 0;
-        const totalCacheOps = this._metrics.cacheHits + this._metrics.cacheMisses;
-        const cacheHitRate = totalCacheOps > 0 ? (this._metrics.cacheHits / totalCacheOps) * 100 : 0;
+    /** Helper: iterate the ring buffer entries (newest to oldest) */
+    _iterRing(buf, idx, len) {
+        const results = [];
+        for (let i = 0; i < len; i++) {
+            const pos = (idx - 1 - i + buf.length) % buf.length;
+            if (buf[pos] !== undefined) results.push(buf[pos]);
+        }
+        return results;
+    }
 
-        const latestMemory = this._metrics.memoryUsage.length > 0 ? this._metrics.memoryUsage[this._metrics.memoryUsage.length - 1] : null;
+    getStats() {
+        const now = Date.now();
+        const ops = this._iterRing(this._ops, this._opsIdx, this._opsLen);
+        const opsPerSec = ops.filter(op => now - op.timestamp < 1000).length;
+
+        let totalLatency = 0;
+        for (let i = 0; i < this._latsLen; i++) {
+            totalLatency += this._lats[i];
+        }
+        const avgLatency = this._latsLen > 0 ? totalLatency / this._latsLen : 0;
+
+        const totalCacheOps = this._cacheHits + this._cacheMisses;
+        const cacheHitRate = totalCacheOps > 0 ? (this._cacheHits / totalCacheOps) * 100 : 0;
+
+        const memEntries = this._iterRing(this._mem, this._memIdx, this._memLen);
+        const latestMemory = memEntries.length > 0 ? memEntries[0] : null;
         const memoryUsageMB = latestMemory ? latestMemory.used / (1024 * 1024) : 0;
 
         return {
@@ -4186,14 +4715,18 @@ class PerformanceMonitor {
         if (stats.avgLatency > 100) {
             tips.push('High average latency detected. Consider enabling compression and indexing frequently queried fields.');
         }
-        if (stats.cacheHitRate < 50 && (this._metrics.cacheHits + this._metrics.cacheMisses) > 20) {
+        if (stats.cacheHitRate < 50 && (this._cacheHits + this._cacheMisses) > 20) {
             tips.push('Low cache hit rate. Consider increasing cache size or optimizing query patterns.');
         }
-        if (this._metrics.memoryUsage.length > 10) {
-            const recent = this._metrics.memoryUsage.slice(-10);
-            const trend = recent[recent.length - 1].used - recent[0].used;
-            if (trend > 10 * 1024 * 1024) {
-                tips.push('Memory usage is increasing rapidly. Check for memory leaks or consider batch processing.');
+        if (this._memLen > 10) {
+            const memEntries = this._iterRing(this._mem, this._memIdx, Math.min(this._memLen, 10));
+            const oldest = memEntries[memEntries.length - 1];
+            const newest = memEntries[0];
+            if (oldest && newest) {
+                const trend = newest.used - oldest.used;
+                if (trend > 10 * 1024 * 1024) {
+                    tips.push('Memory usage is increasing rapidly. Check for memory leaks or consider batch processing.');
+                }
             }
         }
         return tips.length > 0 ? tips : ['Performance is optimal. No issues detected.'];
@@ -4302,6 +4835,10 @@ class Collection {
 
         // Document-level cache: avoids IDB reads + deserialization for repeated get() calls
         this._docCache = new LRUCache(200);
+
+        // Generation counter: bumped on every write, included in query cache keys.
+        // Old cache entries die naturally via LRU eviction — no nuclear clear() needed.
+        this._cacheGeneration = 0;
 
         // Pending indexes: definitions registered before init() — applied during init
         this._pendingIndexes = [];
@@ -4426,7 +4963,7 @@ class Collection {
 
         await this._checkSpaceLimit();
         await this._trigger('afterAdd', doc);
-        this._cacheStrategy.clear();
+        this._cacheGeneration++;
         this._docCache.set(doc._id, fullDoc);
         return doc._id;
     }
@@ -4541,7 +5078,7 @@ class Collection {
         this.database.metadata.setCollection(this._metadata);
 
         await this._trigger('afterUpdate', doc);
-        this._cacheStrategy.clear();
+        this._cacheGeneration++;
         this._docCache.set(doc._id, newDocOutput);
         return doc._id;
     }
@@ -4569,28 +5106,36 @@ class Collection {
 
         await this._trigger('beforeDelete', docId);
 
-        const doc = await this._indexedDB.get(this._db, this._storeName, docId);
-        if (!doc) {
+        const stored = await this._indexedDB.get(this._db, this._storeName, docId);
+        if (!stored) {
             throw new LacertaDBError('Document not found for deletion', 'DOCUMENT_NOT_FOUND');
         }
 
-        if (doc._permanent && !options.force) {
+        if (stored._permanent && !options.force) {
             throw new LacertaDBError(
                 'Cannot delete a permanent document. Use options.force = true to force deletion.',
                 'PERMANENT_DOCUMENT_PROTECTION'
             );
         }
 
-        if (doc._permanent && options.force) {
+        if (stored._permanent && options.force) {
             console.warn(`Force deleting permanent document: ${docId}`);
         }
 
-        const fullDoc = await this.get(docId);
+        // Unpack the doc we already fetched — no second IDB read
+        const existingDoc = new Document(stored, {
+            encrypted: stored._encrypted,
+            compressed: stored._compressed
+        }, this._serializer);
+        if (stored.packedData) {
+            await existingDoc.unpack(this.database.encryption);
+        }
+        const fullDoc = existingDoc.objectOutput();
 
         await this._indexManager.updateIndexForDocument(docId, fullDoc, null);
 
         await this._indexedDB.delete(this._db, this._storeName, docId);
-        const attachments = doc._attachments;
+        const attachments = stored._attachments;
         if (attachments && attachments.length > 0) {
             await this._opfs.deleteAttachments(this.database.name, this.name, docId);
         }
@@ -4599,14 +5144,14 @@ class Collection {
         this.database.metadata.setCollection(this._metadata);
 
         await this._trigger('afterDelete', docId);
-        this._cacheStrategy.clear();
+        this._cacheGeneration++;
         this._docCache.delete(docId);
     }    async query(filter = {}, options = {}) {
         if (!this._initialized) await this.init();
 
         const startTime = performance.now();
 
-        const cacheKey = _stableCacheKey(filter, options);
+        const cacheKey = _stableCacheKey(filter, options) ^ (this._cacheGeneration * 2654435761);
         const cached = this._cacheStrategy.get(cacheKey);
 
         if (cached) {
@@ -4618,24 +5163,51 @@ class Collection {
         let results;
         let usedIndex = false;
 
+        // --- Index selection: pick the most selective matching index ---
+        let bestIndex = null;
+        let bestSize = Infinity;
+
         for (const [indexName, index] of this._indexManager.indexes) {
             const fieldValue = filter[index.fieldPath];
             if (fieldValue !== undefined) {
-                const docIds = await this._indexManager.query(indexName, fieldValue);
-                results = await Promise.all(
-                    docIds.map(id => this.get(id).catch(() => null))
-                );
-                results = results.filter(Boolean);
-                usedIndex = true;
-                break;
+                const indexData = this._indexManager._indexData.get(indexName);
+                const size = indexData ? (indexData.size || 0) : Infinity;
+                if (size < bestSize) {
+                    bestSize = size;
+                    bestIndex = { indexName, fieldValue };
+                }
             }
         }
 
-        if (!usedIndex) {
-            results = await this.getAll(options);
-            if (Object.keys(filter).length > 0) {
-                results = results.filter(doc => queryEngine.evaluate(doc, filter));
+        if (bestIndex) {
+            const docIds = await this._indexManager.query(bestIndex.indexName, bestIndex.fieldValue);
+            results = await Promise.all(
+                docIds.map(id => this.get(id).catch(() => null))
+            );
+            results = results.filter(Boolean);
+
+            // Apply remaining filter fields the index didn't cover
+            const remainingFilter = {};
+            const indexedField = this._indexManager.indexes.get(bestIndex.indexName).fieldPath;
+            for (const key in filter) {
+                if (key !== indexedField) remainingFilter[key] = filter[key];
             }
+            if (Object.keys(remainingFilter).length > 0) {
+                results = results.filter(doc => queryEngine.evaluate(doc, remainingFilter));
+            }
+            usedIndex = true;
+        }
+
+        if (!usedIndex) {
+            const hasFilter = Object.keys(filter).length > 0;
+            // Can we short-circuit? Only if no sort is needed.
+            const canShortCircuit = !options.sort && hasFilter;
+            const target = canShortCircuit ? (options.skip || 0) + (options.limit || Infinity) : Infinity;
+
+            results = await this._scanWithFilter(
+                hasFilter ? filter : null,
+                target
+            );
         }
 
         if (options.sort) results = aggregationPipeline.stages.$sort(results, options.sort);
@@ -4651,6 +5223,64 @@ class Collection {
         }
 
         this._cacheStrategy.set(cacheKey, results);
+
+        return results;
+    }
+
+    /**
+     * Cursor-based scan: fetches documents in batches, deserializes and
+     * evaluates filter per-batch, stops early when target count is reached.
+     * Avoids loading + deserializing the entire collection for selective queries.
+     *
+     * @param {object|null} filter - Query filter, or null for all docs
+     * @param {number} target - Stop after collecting this many matches (Infinity = no limit)
+     * @returns {Promise<Array>}
+     */
+    async _scanWithFilter(filter, target) {
+        const results = [];
+        let lastKey = null;
+        const batchSize = 200;
+
+        while (true) {
+            const batch = await this._indexedDB.getBatch(
+                this._db, this._storeName, lastKey, batchSize
+            );
+
+            if (batch.length === 0) break;
+
+            for (const docData of batch) {
+                lastKey = docData._id;
+
+                // Skip persisted index entries
+                if (typeof docData._id === 'string' && docData._id.startsWith(IndexManager.IDX_PREFIX)) {
+                    continue;
+                }
+
+                try {
+                    const doc = new Document(docData, {
+                        encrypted: docData._encrypted,
+                        compressed: docData._compressed
+                    }, this._serializer);
+
+                    if (docData.packedData) {
+                        await doc.unpack(this.database.encryption);
+                    }
+
+                    const output = doc.objectOutput();
+
+                    if (!filter || queryEngine.evaluate(output, filter)) {
+                        results.push(output);
+                        this._docCache.set(docData._id, output);
+
+                        if (results.length >= target) return results;
+                    }
+                } catch (error) {
+                    console.error(`Failed to unpack document ${docData._id}:`, error);
+                }
+            }
+
+            if (batch.length < batchSize) break;
+        }
 
         return results;
     }
@@ -4736,15 +5366,27 @@ class Collection {
         const skipped = [];
         const useSync = !this.database.encryption && !(options.compressed);
 
-        // Phase 1: Bulk-fetch all existing docs in a single IDB read transaction
-        const updateIds = updates.map(u => u.id);
+        // Phase 1: Fetch only the documents we need (not the entire collection)
         const storedMap = new Map();
 
-        // Fetch all at once via getAll, then build a Map for O(1) lookup
-        const allStored = await this._indexedDB.getAll(this._db, this._storeName);
-        for (const doc of allStored) {
-            if (doc._id && updateIds.includes(doc._id)) {
-                storedMap.set(doc._id, doc);
+        // Single read transaction: fetch all target docs at once via IDB getAll
+        // with a bounded key set, falling back to individual gets for small batches
+        if (updates.length <= 20) {
+            // Small batch: individual gets (avoids loading/filtering entire store)
+            const fetches = updates.map(u =>
+                this._indexedDB.get(this._db, this._storeName, u.id)
+                    .then(doc => doc && storedMap.set(u.id, doc))
+                    .catch(() => {})
+            );
+            await Promise.all(fetches);
+        } else {
+            // Larger batch: use getAll + Set-based filter (still cheaper than N transactions)
+            const updateIdSet = new Set(updates.map(u => u.id));
+            const allStored = await this._indexedDB.getAll(this._db, this._storeName);
+            for (const doc of allStored) {
+                if (doc._id && updateIdSet.has(doc._id)) {
+                    storedMap.set(doc._id, doc);
+                }
             }
         }
 
@@ -4804,7 +5446,7 @@ class Collection {
         }
 
         this.database.metadata.setCollection(this._metadata);
-        this._cacheStrategy.clear();
+        this._cacheGeneration++;
 
         if (this._performanceMonitor) {
             this._performanceMonitor.recordOperation('batchUpdate', performance.now() - startTime);
@@ -4831,21 +5473,51 @@ class Collection {
         const docsToRemove = [];
         const skipped = [];
 
-        // Phase 1: Validate all documents and prepare delete operations
+        // Phase 1: Bulk-fetch all target docs, validate, and unpack in-place
+        const storedMap = new Map();
+
+        if (normalizedItems.length <= 20) {
+            // Small batch: parallel individual gets
+            const fetches = normalizedItems.map(({ id }) =>
+                this._indexedDB.get(this._db, this._storeName, id)
+                    .then(doc => doc && storedMap.set(id, doc))
+                    .catch(() => {})
+            );
+            await Promise.all(fetches);
+        } else {
+            // Large batch: single getAll + Set-filter
+            const idSet = new Set(normalizedItems.map(({ id }) => id));
+            const allStored = await this._indexedDB.getAll(this._db, this._storeName);
+            for (const doc of allStored) {
+                if (doc._id && idSet.has(doc._id)) {
+                    storedMap.set(doc._id, doc);
+                }
+            }
+        }
+
         for (const { id, options } of normalizedItems) {
-            const doc = await this._indexedDB.get(this._db, this._storeName, id);
-            if (!doc) {
+            const stored = storedMap.get(id);
+            if (!stored) {
                 skipped.push({ success: false, id, error: 'Document not found' });
                 continue;
             }
 
-            if (doc._permanent && !options.force) {
+            if (stored._permanent && !options.force) {
                 skipped.push({ success: false, id, error: 'Cannot delete permanent document without force flag' });
                 continue;
             }
 
-            const fullDoc = await this.get(id);
-            docsToRemove.push({ id, fullDoc, stored: doc });
+            // Unpack directly from the raw doc — no second IDB fetch
+            const existingDoc = new Document(stored, {
+                encrypted: stored._encrypted,
+                compressed: stored._compressed
+            }, this._serializer);
+            if (stored.packedData) {
+                await existingDoc.unpack(this.database.encryption);
+            }
+            const fullDoc = existingDoc.objectOutput();
+
+            docsToRemove.push({ id, fullDoc, stored });
 
             operations.push({
                 type: 'delete',
@@ -4874,7 +5546,7 @@ class Collection {
         }
 
         this.database.metadata.setCollection(this._metadata);
-        this._cacheStrategy.clear();
+        this._cacheGeneration++;
 
         if (this._performanceMonitor) {
             this._performanceMonitor.recordOperation('batchDelete', performance.now() - startTime);
@@ -5836,6 +6508,7 @@ export {
     BTreeIndex,
     TextIndex,
     GeoIndex,
+    HashIndex,
     SecureDatabaseEncryption,
     QuickStore,
     AsyncMutex,

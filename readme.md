@@ -2,7 +2,7 @@
   <img src="https://raw.githubusercontent.com/pixagram-blockchain/LacertaDB/main/logo.webp?raw=true" alt="LacertaDB Logo" width="800"/>
 </p>
 
-<h1 align="center">LacertaDB 0.11.4</h1>
+<h1 align="center">LacertaDB 0.13.2</h1>
 
 <p align="center">
   <strong>A high-performance, browser-native document database with encryption, indexing, and MongoDB-like queries.</strong>
@@ -101,12 +101,24 @@ LacertaDB is a **browser-native** document database built for Web3 applications,
 <td>
 
 ### Performance
-- **LRU / LFU / TTL** caching strategies per collection
-- **Compression** via CompressionStream (deflate) with magic-byte detection
-- **Cursor-free batch indexing** to prevent `TransactionInactiveError`
-- **Read-optimized mutex** — no global lock on read transactions
-- Built-in performance monitor with optimization tips
-- Idle callback scheduling to keep UI responsive
+
+| Operation | LacertaDB | PouchDB 7.3 | Speedup |
+|-----------|-----------|-------------|---------|
+| **Bulk Write** | 532 ms | 2,664 ms | **5×** |
+| **Read All** | 146 ms | 356 ms | **2.4×** |
+| **Query** | 124 ms | 399 ms | **3.2×** |
+| **Bulk Update** | 101 ms | 2,708 ms | **26.8×** |
+| **Delete All** | 239 ms | 2,573 ms | **10.8×** |
+
+**Why the Gap? It's the Serializer.** LacertaDB uses [TurboSerial](https://www.npmjs.com/package/@pixagram/turboserial).
+
+### TurboSerial vs MessagePack vs CBOR
+
+| Test Case | MessagePack | CBOR | TurboSerial |
+|-----------|:-----------:|:----:|:-----------:|
+| **Small Data** (API response) | 20,101 ops/s · 34B | 112,360 ops/s · 36B | **176,991 ops/s** · 62B |
+| **Medium Data** (array of objects) | 334 ops/s · 4,093B | 3,460 ops/s · 4,168B | **5,587 ops/s** · 4,809B |
+| **Large Data** (TypedArray 0.2MB) | 711 ops/s · 200,005B | 341 ops/s · 200,005B | **2,703 ops/s** · 200,023B |
 
 </td>
 </tr>
