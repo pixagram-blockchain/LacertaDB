@@ -1,7 +1,7 @@
 /**
- * LacertaDB V0.13.0 - Production Library
+ * LacertaDB V0.14.0 - Production Library
  * @module LacertaDB
- * @version 0.13.0
+ * @version 0.14.0
  * @license MIT
  * @author Pixagram SA
  */
@@ -87,6 +87,16 @@ class QuickStore {
             }
             this._saveTimer = null;
         }
+    }
+
+    /**
+     * Re-point at a new IDB connection. _ensureStore closes and reopens the
+     * connection to create object stores; without this the snapshot taken at
+     * construction goes stale and every persist silently no-ops.
+     * @param {IDBDatabase} idb
+     */
+    setIDB(idb) {
+        this._idb = idb;
     }
 
     /** Hydrate all quickstore docs from IDB on startup */
@@ -2587,7 +2597,13 @@ class IndexManager {
                         compressed: docData._compressed,
                         encrypted: docData._encrypted
                     }, this._serializer);
-                    await d.unpack(this._collection.database.encryption);
+                    try {
+                        await d.unpack(this._collection.database.encryption);
+                    } catch (e) {
+                        // A single unreadable document must not abort the rebuild.
+                        console.warn(`[IndexManager] Skipping '${docData._id}' during rebuild of '${indexName}':`, e.message);
+                        continue;
+                    }
                     doc = d.objectOutput();
                 }
 
@@ -2711,14 +2727,27 @@ class IndexManager {
      * @param {string} indexName
      */
     async _persistIndex(indexName) {
+        const payload = this._buildIndexPayload(indexName);
+        if (!payload) return;
+        return this._writeIndexPayloads([payload]);
+    }
+
+    /**
+     * Serialize one index to a storable payload. SYNCHRONOUS on purpose: it must
+     * be callable from destroy() before _indexData is cleared, otherwise the
+     * pending write finds nothing left to persist.
+     * @param {string} indexName
+     * @returns {object|null} payload, or null if the index can't be serialized
+     * @private
+     */
+    _buildIndexPayload(indexName) {
         const indexData = this._indexData.get(indexName);
         const index = this._indexes.get(indexName);
-        if (!indexData || !index) return;
+        if (!indexData || !index) return null;
 
         try {
-            const docId = `${IndexManager.IDX_PREFIX}${indexName}`;
             const payload = {
-                _id: docId,
+                _id: `${IndexManager.IDX_PREFIX}${indexName}`,
                 _type: index.type,
                 _persisted_at: Date.now(),
                 _size: indexData.size || 0
@@ -2726,34 +2755,50 @@ class IndexManager {
 
             switch (index.type) {
                 case 'btree':
-                    if (!(indexData instanceof BTreeIndex)) return;
+                    if (!(indexData instanceof BTreeIndex)) return null;
                     payload._entries = indexData.toSortedEntries();
                     break;
 
                 case 'text':
-                    if (!(indexData instanceof TextIndex)) return;
+                    if (!(indexData instanceof TextIndex)) return null;
                     payload._data = indexData.toSerializable();
                     break;
 
                 case 'geo':
-                    if (!(indexData instanceof GeoIndex)) return;
+                    if (!(indexData instanceof GeoIndex)) return null;
                     payload._data = indexData.toSerializable();
                     break;
 
                 case 'hash':
-                    if (!(indexData instanceof HashIndex)) return;
+                    if (!(indexData instanceof HashIndex)) return null;
                     payload._entries = indexData.toSerializable();
                     break;
 
                 default:
-                    return; // Unknown type, skip
+                    return null; // Unknown type, skip
             }
 
-            await this._collection._indexedDB.put(
-                this._collection._db, this._collection._storeName, payload
-            );
+            return payload;
         } catch (e) {
-            console.warn(`[IndexManager] Failed to persist index '${indexName}':`, e.message);
+            console.warn(`[IndexManager] Failed to serialize index '${indexName}':`, e.message);
+            return null;
+        }
+    }
+
+    /**
+     * Write pre-built index payloads to IDB.
+     * @param {Array<object>} payloads
+     * @private
+     */
+    async _writeIndexPayloads(payloads) {
+        for (const payload of payloads) {
+            try {
+                await this._collection._indexedDB.put(
+                    this._collection._db, this._collection._storeName, payload
+                );
+            } catch (e) {
+                console.warn(`[IndexManager] Failed to persist index '${payload._id}':`, e.message);
+            }
         }
     }
 
@@ -3121,11 +3166,23 @@ class IndexManager {
         return report;
     }
 
+    /**
+     * Tear down, flushing pending index writes.
+     * @returns {Promise<void>} resolves once queued writes have been attempted
+     */
     destroy() {
         if (this._persistTimer) {
             clearTimeout(this._persistTimer);
             this._persistTimer = null;
         }
+
+        // Snapshot dirty indexes BEFORE clearing the structures below.
+        const payloads = [];
+        for (const name of this._dirtyIndexes) {
+            const payload = this._buildIndexPayload(name);
+            if (payload) payloads.push(payload);
+        }
+
         for (const [name, indexData] of this._indexData) {
             if (indexData && indexData.clear) {
                 indexData.clear();
@@ -3136,6 +3193,8 @@ class IndexManager {
         this._dirtyIndexes.clear();
         this._indexQueue = [];
         this._processing = false;
+
+        return this._writeIndexPayloads(payloads);
     }
 }
 
@@ -3495,7 +3554,7 @@ class Document {
         this._created = data._created || Date.now();
         this._modified = data._modified || Date.now();
         this._permanent = data._permanent || options.permanent || false;
-        this._encrypted = false;
+        this._encrypted = data._encrypted || options.encrypted || false;
         this._compressed = data._compressed || options.compressed || false;
         this._attachments = data._attachments || [];
         this._data = null;
@@ -3559,9 +3618,12 @@ class Document {
 
             return this.data;
         } catch (error) {
-            console.error('Document unpack failed:', error);
-            this.data = {};
-            return this.data;
+            // Do NOT swallow this. Returning {} here turns an undecryptable or
+            // corrupt document into a silently empty one, and callers that merge
+            // ({...existingDoc.data, ...updates}) then destroy every field.
+            throw new LacertaDBError(
+                `Failed to unpack document '${this._id}'`, 'UNPACK_FAILED', error
+            );
         }
     }
 
@@ -5057,7 +5119,10 @@ class Collection {
             throw new LacertaDBError(`Document with id '${docId}' not found for update.`, 'DOCUMENT_NOT_FOUND');
         }
 
-        const existingDoc = new Document(stored, {}, this._serializer);
+        const existingDoc = new Document(stored, {
+            encrypted: stored._encrypted,
+            compressed: stored._compressed
+        }, this._serializer);
         if (stored.packedData) await existingDoc.unpack(this.database.encryption);
 
         const oldDocOutput = existingDoc.objectOutput();
@@ -5148,7 +5213,13 @@ class Collection {
             compressed: stored._compressed
         }, this._serializer);
         if (stored.packedData) {
-            await existingDoc.unpack(this.database.encryption);
+            try {
+                await existingDoc.unpack(this.database.encryption);
+            } catch (e) {
+                // A corrupt document must still be deletable; index entries are
+                // cleaned up by id from whatever fields are available.
+                console.warn(`Unpack failed for '${docId}' during delete; deleting anyway.`, e.message);
+            }
         }
         const fullDoc = existingDoc.objectOutput();
 
@@ -5417,8 +5488,19 @@ class Collection {
                 continue;
             }
 
-            const existingDoc = new Document(stored, {}, this._serializer);
-            if (stored.packedData) await existingDoc.unpack(this.database.encryption);
+            const existingDoc = new Document(stored, {
+                encrypted: stored._encrypted,
+                compressed: stored._compressed
+            }, this._serializer);
+            if (stored.packedData) {
+                try {
+                    await existingDoc.unpack(this.database.encryption);
+                } catch (e) {
+                    // Merging into {} would blank every field not in update.data.
+                    skipped.push({ success: false, id: update.id, error: `Unpack failed: ${e.message}` });
+                    continue;
+                }
+            }
 
             oldDocs.push(existingDoc.objectOutput());
 
@@ -5533,7 +5615,11 @@ class Collection {
                 compressed: stored._compressed
             }, this._serializer);
             if (stored.packedData) {
-                await existingDoc.unpack(this.database.encryption);
+                try {
+                    await existingDoc.unpack(this.database.encryption);
+                } catch (e) {
+                    console.warn(`Unpack failed for '${id}' during batchDelete; deleting anyway.`, e.message);
+                }
             }
             const fullDoc = existingDoc.objectOutput();
 
@@ -5663,10 +5749,13 @@ class Collection {
             this._metadata.destroy();
         }
 
-        // Flush dirty index data to IDB before teardown
+        // Flush dirty index data to IDB before teardown. IndexManager.destroy()
+        // snapshots payloads synchronously and returns the write promise, so the
+        // flush survives its own teardown (the previous flushPersistence() call
+        // was defeated by destroy() clearing _indexData underneath it).
+        let pendingFlush = Promise.resolve();
         if (this._indexManager) {
-            this._indexManager.flushPersistence().catch(() => {});
-            this._indexManager.destroy();
+            pendingFlush = this._indexManager.destroy().catch(() => {});
         }
 
         // Clear the cleanup interval
@@ -5685,11 +5774,14 @@ class Collection {
             this._docCache.clear();
         }
 
-        // Release the connection reference (owned by parent Database)
-        this._db = null;
+        // NOTE: _db is a getter onto the parent Database, so there is nothing to
+        // release here. Assigning to it threw TypeError in strict mode, which
+        // aborted every teardown path (dropCollection, Database.destroy, ...).
 
         // Clear event listeners
         this._events.clear();
+
+        return pendingFlush;
     }
 }
 
@@ -5853,12 +5945,40 @@ class Database {
             }
 
             this._db = await this._openIDB(this._idbVersion);
+            this._refreshIDBRefs();
         })();
 
         try {
             await this._ensureStorePromise;
         } finally {
             this._ensureStorePromise = null;
+        }
+    }
+
+    /**
+     * Re-point every object holding a snapshot of the IDB connection at the
+     * current one.
+     *
+     * _ensureStore() closes and reopens the connection to create object stores.
+     * Collection reads the connection through a getter and is unaffected, but
+     * DatabaseMetadata, Settings, QuickStore and each CollectionMetadata receive
+     * it by value at construction. Their write guard is
+     * `db.objectStoreNames.contains('__meta')`, which still reads from the closed
+     * connection's cached list, so the guard passes and db.transaction() throws
+     * InvalidStateError -- which _writeMeta swallows. The result was that every
+     * metadata and quickstore write was silently discarded from the first
+     * version bump onward.
+     * @private
+     */
+    _refreshIDBRefs() {
+        const db = this._db;
+        if (this._metadata && this._metadata.setIDB) this._metadata.setIDB(db);
+        if (this._settings && this._settings.setIDB) this._settings.setIDB(db);
+        if (this._quickStore && this._quickStore.setIDB) this._quickStore.setIDB(db);
+        for (const collection of this._collections.values()) {
+            if (collection._metadata && collection._metadata.setIDB) {
+                collection._metadata.setIDB(db);
+            }
         }
     }
 
